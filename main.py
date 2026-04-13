@@ -2,7 +2,6 @@ import os
 import sys
 import json
 import tempfile
-import platform
 from pathlib import Path
     
 try:
@@ -55,12 +54,15 @@ DEFAULT_CONFIG = {
     'max_undo': 128,
     'wrap': False,
 }
-SYSTEM = platform.system()
-PREFIX_KEY = 'Command' if SYSTEM == 'Darwin' else 'Control'
+SYSTEM = sys.platform
+PREFIX_KEY = 'Command' if SYSTEM == 'darwin' else 'Control'
+
+path_exist = os.path.exists
+base_name = os.path.basename
 
 def load_config():
     """Load settings from the config file."""
-    if os.path.exists(CONFIG_FILE):
+    if path_exist(CONFIG_FILE):
         try:
             # raise Exception(':P')
             with open(CONFIG_FILE, 'r', encoding=ENCODING, errors=ENCODING_ERROR_HANDLER) as f:
@@ -80,7 +82,7 @@ def save_config(config):
         os.replace(temp_path, CONFIG_FILE)
         
     except Exception as e:
-        if os.path.exists(temp_path):
+        if path_exist(temp_path):
             os.remove(temp_path)
         # showerror("Configuration Error", f"Failed to save settings!\nError: {e}")
         print(f'Failed to save config: {e}')
@@ -133,13 +135,13 @@ def quick_text_editor(initial_path=None):
             'Ctrl-C          →  Copy (whole line if no selection)\n'
             'Ctrl-X          →  Cut (whole line if no selection)\n'
             'Ctrl-A          →  Select All\n'
-            'Ctrl-D          →  Duplicate Line\n'
+            'Ctrl-D          →  Duplicate Line(s)\n'
             'Ctrl-Backspace  →  Delete Previous Word\n'
             'Ctrl-Del        →  Delete Next Word\n'
             'Tab             →  Indent (4 Spaces)\n'
             'Shift-Tab       →  Unindent (4 spaces)\n'
         )
-        if SYSTEM == 'Darwin':
+        if SYSTEM == 'darwin':
             shortcuts_text = shortcuts_text.replace('Ctrl-', '⌘-')
 
         label = Label(win, text=shortcuts_text, justify='left', font=(text_font[0], 12),
@@ -186,23 +188,51 @@ def quick_text_editor(initial_path=None):
         return 'break'
 
     def on_ctrl_d(event):
-        line_start = text_field.index('insert linestart')
-        line_end = text_field.index('insert lineend')
-        line_content = text_field.get(line_start, line_end)
-        # Insert a newline and the content at the start of the next line
-        text_field.insert(f"{line_end}", f"\n{line_content}")
+        try:
+            # If text is selected, duplicate the selection
+            start, end = text_field.index("sel.first"), text_field.index("sel.last")
+            content = text_field.get(start, end)
+            text_field.insert(end, content)
+        except:
+            # Otherwise, duplicate current line
+            line_start = text_field.index('insert linestart')
+            line_end = text_field.index('insert lineend')
+            line_content = text_field.get(line_start, line_end)
+            text_field.insert(f"{line_end}", f"\n{line_content}")
         return 'break'
 
     def on_tab(event):
-        text_field.insert('insert', ' ' * indent_size)
+        try:
+            # Get range of selected lines
+            start_line = int(text_field.index("sel.first").split('.')[0])
+            end_line = int(text_field.index("sel.last").split('.')[0])
+            
+            for i in range(start_line, end_line + 1):
+                text_field.insert(f"{i}.0", ' ' * indent_size)
+        except:
+            # No selection, just insert spaces at cursor
+            text_field.insert('insert', ' ' * indent_size)
         return 'break'
 
     def on_shift_tab(event):
-        line_start = "insert linestart"
-        head = text_field.get(line_start, f"{line_start} + {indent_size}c")
-        if head.startswith(' '):
-            num_spaces = len(head) - len(head.lstrip(' '))
-            text_field.delete(line_start, f"{line_start} + {num_spaces}c")
+        try:
+            # Determine range: selected lines or just current line
+            if text_field.tag_ranges("sel"):
+                start_line = int(text_field.index("sel.first").split('.')[0])
+                end_line = int(text_field.index("sel.last").split('.')[0])
+            else:
+                start_line = end_line = int(text_field.index("insert").split('.')[0])
+
+            for i in range(start_line, end_line + 1):
+                line_start = f"{i}.0"
+                # Check for spaces at the start of the line
+                content = text_field.get(line_start, f"{line_start} + {indent_size}c")
+                if content.startswith(' '):
+                    # Remove up to indent_size leading spaces
+                    num_to_del = len(content) - len(content.lstrip(' '))
+                    text_field.delete(line_start, f"{line_start} + {num_to_del}c")
+        except Exception as e:
+            print(f"Shift-Tab error: {e}")
         return 'break'
         
     def change_font(delta):
@@ -236,19 +266,24 @@ def quick_text_editor(initial_path=None):
             h_scrollbar.grid()
             
     def apply_theme():
+        buttons = (
+            new_btn, open_btn, save_btn, save_as_btn, shortcuts_btn, plus_btn,
+            minus_btn, wrap_btn, search_btn, theme_btn,
+        )
+        
         if dark_mode:
             root.config(bg='#0f172a')
-            top_frame.config(bg='#001033')
+            top_frame.config(bg='#243B49')
             text_field.config(bg=dark_bg, fg=dark_fg, insertbackground='#e5e7eb')
-            theme_btn.config(bg='#1e293b', fg='#e5e7eb', text='☀ Light')
-            for btn in [new_btn, open_btn, save_btn, save_as_btn, shortcuts_btn, plus_btn, minus_btn, wrap_btn, search_btn]:
-                btn.config(bg='#1e293b', fg='#e5e7eb', activebackground='#334155')
+            theme_btn.config(text='☀ Light')
+            for btn in buttons:
+                btn.config(bg='#212121', fg='#e5e7eb', activebackground='#334155')
         else:
             root.config(bg='#f8fafc')
             top_frame.config(bg='#2d5ac4')
             text_field.config(bg=light_bg, fg=light_fg, insertbackground='black')
-            theme_btn.config(bg='#e5e7eb', fg='black', text='🌙 Dark')
-            for btn in [new_btn, open_btn, save_btn, save_as_btn, shortcuts_btn, plus_btn, minus_btn, wrap_btn, search_btn]:
+            theme_btn.config(text='🌙 Dark')
+            for btn in buttons:
                 btn.config(bg='#e5e7eb', fg='black', activebackground='#d1d5db')
 
     def toggle_theme(event=None):
@@ -321,10 +356,14 @@ def quick_text_editor(initial_path=None):
         err = ''.join(traceback.format_exception(exc, val, tb))
         print(f"\nInternal Error Caught:\n{err}")
         showerror("Internal Error", f"An unexpected error occurred:\n{val}")
-    
+
+    def check_font_exists(font_name):
+        actual_family = font.Font(family=font_name).actual("family")
+        return actual_family.lower() == font_name.lower()
+
     # --- FILE HANDLING ---
     def set_title():
-        name = os.path.basename(current_file_path) if current_file_path else "Untitled"
+        name = base_name(current_file_path) if current_file_path else "Untitled"
         root.title(f"{name} - Quick Text Editor")
     
     def check_file_size(path):
@@ -359,7 +398,7 @@ def quick_text_editor(initial_path=None):
         if is_modified():
             response = askyesno(
                 "Confirm",
-                f"Discard changes and open '{os.path.basename(path)}'?",
+                f"Discard changes and open '{base_name(path)}'?",
                 default='no',
                 parent=root,
             )
@@ -371,6 +410,9 @@ def quick_text_editor(initial_path=None):
                 content = f.read()
             text_field.delete('1.0', END)
             text_field.insert('1.0', content)
+            text_field.mark_set("insert", "1.0")
+            text_field.see("1.0")
+            text_field.edit_reset()
             current_file_path = path
             update_mtime()
             update_initial_hash()
@@ -390,7 +432,10 @@ def quick_text_editor(initial_path=None):
             if not response: return
         
         text_field.delete('1.0', END)
+        text_field.edit_reset()
         current_file_path = None
+        update_mtime()
+        update_initial_hash()
         set_title()
 
     def open_file(event=None):
@@ -400,6 +445,7 @@ def quick_text_editor(initial_path=None):
                 "Confirm",
                 "Discard current text and open another file?",
                 default='no',
+                parent=root,
             )
             if not response: return
         
@@ -410,6 +456,9 @@ def quick_text_editor(initial_path=None):
                     content = f.read()
                 text_field.delete('1.0', END)
                 text_field.insert('1.0', content)
+                text_field.mark_set("insert", "1.0")
+                text_field.see("1.0")
+                text_field.edit_reset()
                 current_file_path = path
                 update_mtime()
                 update_initial_hash()
@@ -453,9 +502,20 @@ def quick_text_editor(initial_path=None):
         if editing_big_file: return None
         return hash(text_field.get('1.0', 'end-1c'))
 
-    def update_initial_hash():
+    def update_initial_hash(from_file=False):
         nonlocal initial_content_hash
-        initial_content_hash = get_content_hash()
+        if from_file and path_exist(current_file_path) and not editing_big_file:
+            with open(current_file_path, 'r', encoding=ENCODING, errors=ENCODING_ERROR_HANDLER) as f:
+                initial_content_hash = hash(f.read())
+        else:
+            initial_content_hash = get_content_hash()
+    
+    def update_mtime():
+        nonlocal last_mtime
+        if current_file_path and path_exist(current_file_path):
+            last_mtime = os.path.getmtime(current_file_path)
+        else:
+            last_mtime = 0
     
     def is_modified():
         if editing_big_file: return True
@@ -464,24 +524,46 @@ def quick_text_editor(initial_path=None):
             return bool(current_text)
         else:
             return get_content_hash() != initial_content_hash
-    
-    def update_mtime():
-        nonlocal last_mtime
-        if current_file_path and os.path.exists(current_file_path):
-            last_mtime = os.path.getmtime(current_file_path)
-            
+              
     def check_external_modification(event=None):
-        nonlocal last_mtime
-        if not current_file_path or not os.path.exists(current_file_path):
+        nonlocal current_file_path, last_mtime
+        # This is a draft, no need to check
+        if not current_file_path:
             return
         
+        # Check if it's been deleted.
+        elif not path_exist(current_file_path):
+            # Temporarily clear path to prevent scheduled FocusIn loops while y/n dialog is focused
+            temp_path = current_file_path
+            current_file_path = None
+            last_mtime = 0
+            msg = f"'{base_name(temp_path)}' has been deleted externally.\n\nSave now?"
+            
+            response = askyesno(
+                "File Deleted",
+                msg,
+                icon='warning',
+                default='yes',
+                parent=root,
+            )
+            if response is True:
+                current_file_path = temp_path
+                if save_file():
+                    update_mtime()
+                    update_initial_hash()
+                else:
+                    current_file_path = None
+                
+            set_title()
+            return
+        
+        # Check if it's been modified.
         try: current_mtime = os.path.getmtime(current_file_path)
         except: return
         
         if last_mtime and current_mtime > last_mtime:
             last_mtime = current_mtime
-            
-            msg = f"'{os.path.basename(current_file_path)}' was modified externally."
+            msg = f"'{base_name(current_file_path)}' was modified externally."
             icon = 'question'
             
             if is_modified():
@@ -492,18 +574,32 @@ def quick_text_editor(initial_path=None):
                 "File Conflict",
                 f"{msg}\n\nReload from disk?",
                 icon=icon,
+                default='yes',
                 parent=root,
             )
+            
             if response:
                 try:
                     with open(current_file_path, 'r', encoding=ENCODING, errors=ENCODING_ERROR_HANDLER) as f:
                         content = f.read()
+                    # Realod, save to undo stack, and scroll up
+                    # Here is a bug of scrolling to bottom when clicking Ctrl-Z
+                    text_field.config(autoseparators=False)
+                    text_field.edit_separator()
                     text_field.delete('1.0', END)
                     text_field.insert('1.0', content)
+                    text_field.edit_separator()
+                    text_field.config(autoseparators=True)
+                    text_field.mark_set("insert", "1.0")
+                    text_field.see("1.0")
                     update_initial_hash()
-
+                    
                 except Exception as e:
                     print(f"Reload error: {e}")
+                    showerror("File Reload Error", f"Could not reload file:\n{e}")
+            else:
+                # Initial hash becomes the modified file hash
+                update_initial_hash(from_file=True)
     
     def on_close():
         nonlocal geometry, maximized
@@ -566,9 +662,9 @@ def quick_text_editor(initial_path=None):
                 except: pass
     
     # Font Type
-    text_font = next((f for f in font_priority if f in font.families()), 'monospace')
+    text_font = next((f for f in font_priority if check_font_exists(f)), 'monospace')
     text_font = [text_font, font_size]
-    ui_font = next((f for f in UI_FONT_PRIORITY if f in font.families()), 'TkDefaultFont')
+    ui_font = next((f for f in UI_FONT_PRIORITY if check_font_exists(f)), 'TkDefaultFont')
     ui_font = [ui_font, 11]
     
     # Key Bindings
@@ -602,7 +698,7 @@ def quick_text_editor(initial_path=None):
     theme_btn = Button(top_frame, text='🌙 Dark', font=ui_font, command=toggle_theme, relief=FLAT)
     wrap_btn = Button(top_frame, text='⤶ Wrap', font=ui_font, command=toggle_wrap, relief=FLAT)
     shortcuts_btn = Button(top_frame, text='⌨ Shortcuts', font=ui_font, command=show_shortcuts, relief=FLAT)
-    plus_btn = Button(top_frame, text='A⁺', font=ui_font, command=lambda: change_font(1), relief=FLAT)
+    plus_btn = Button(top_frame, text='A⁺', font=ui_font, command=lambda: change_font(+1), relief=FLAT)
     minus_btn = Button(top_frame, text='A⁻', font=ui_font, command=lambda: change_font(-1), relief=FLAT)
     search_btn = Button(top_frame, text='🔍 Find', font=ui_font, command=open_search, relief=FLAT)
     
@@ -648,18 +744,28 @@ def quick_text_editor(initial_path=None):
     set_title()
     
     # Open file if available and hash it
-    if current_file_path and os.path.exists(current_file_path) and check_file_size(current_file_path):
+    if current_file_path and path_exist(current_file_path) and check_file_size(current_file_path):
         try:
             with open(current_file_path, 'r', encoding=ENCODING, errors=ENCODING_ERROR_HANDLER) as f:
                 text_field.insert('1.0', f.read())
+            text_field.mark_set("insert", "1.0")
+            text_field.see("1.0")
+            text_field.edit_reset()
             update_mtime()
             update_initial_hash()
         except Exception as e:
             print(f"Startup file load error: {e}")
+            
+    elif current_file_path and not path_exist(current_file_path):
+        # Use a temporary path variable to avoid scheduled 'file deleted' popup when focusing on error dialog
+        rejected_path = current_file_path
+        current_file_path = None
+        if not path_exist(rejected_path):
+            showerror("File Load Error", f"'{rejected_path}' doesn't exist!")
     
     # Start
     try: root.mainloop()
-    except (KeyboardInterrupt, EOFError): print("Editor closed via terminal interrupt.")
+    except (KeyboardInterrupt, EOFError): print("Editor closed via terminal interruption.")
 
 if __name__ == '__main__':
     # Supports opening a file passed as an argument: python script.py my_file.txt
