@@ -3,39 +3,21 @@ import sys
 import json
 import tempfile
 from pathlib import Path
-    
-try:
-    from tkinter import font
-    from tkinter import (Tk, Frame, Button, Text, Label, Scrollbar, Toplevel, Entry, IntVar,
-                         END, X, Y, LEFT, RIGHT, BOTH, FLAT)
-    from tkinter.messagebox import askyesno, askyesnocancel, showerror
-    from tkinter.filedialog import askopenfilename, asksaveasfilename
-    from tkinterdnd2 import DND_FILES, TkinterDnD
-    
-except Exception as e:
-    print(f'Error: {e}')
-    print("Perhaps you didn't install a required module? Use 'pip' to install it.")
-    sys.exit(1)
 
-# --- CONFIGURATION ---
+# --- CONFIG ---
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(SCRIPT_DIR, 'config.json')
+LOCK_FILE = os.path.join(SCRIPT_DIR, "app.lock")
+QUEUE_FILE = os.path.join(SCRIPT_DIR, "queue.txt")
 ENCODING = 'utf-8'
-ENCODING_ERROR_HANDLER = 'replace'
-UI_FONT_PRIORITY = [    # For UI elements, not for text area.
-    'Open Sans',
-    'Segoe UI',
-    'San Francisco',
-    'Helvetica Neue',
-    'Ubuntu',
-    'Cantarell',
-    'Verdana', 
-    'Arial', 
-]
+ENCODING_ERROR_HANDLER = 'surrogateescape'
+SYSTEM = sys.platform
+PREFIX_KEY = 'Command' if SYSTEM == 'darwin' else 'Control'
+
 DEFAULT_CONFIG = {
     'geometry': '800x600',
     'maximized': False,
-    'font_priority': [    # For the text area only.
+    'text_font_priority': [
         'JetBrains Mono',
         'Cascadia Code',
         'Consolas',
@@ -44,7 +26,18 @@ DEFAULT_CONFIG = {
         'Courier New',
         'Courier'
     ],
-    'font_size': 12,
+    'ui_font_priority': [
+        'Open Sans',
+        'Segoe UI',
+        'San Francisco',
+        'Helvetica Neue',
+        'Ubuntu',
+        'Cantarell',
+        'Verdana', 
+        'Arial', 
+    ],
+    'text_font_size': 12,
+    'ui_font_size': 11,
     'dark_mode': True,
     'dark_bg': '#020617',
     'dark_fg': '#e5e7eb',
@@ -52,13 +45,16 @@ DEFAULT_CONFIG = {
     'light_fg': '#000000',
     'indent_size': 4,
     'max_undo': 128,
+    'big_file_size': 4,
     'wrap': False,
+    'independent_windows': False,
 }
-SYSTEM = sys.platform
-PREFIX_KEY = 'Command' if SYSTEM == 'darwin' else 'Control'
 
 path_exist = os.path.exists
 base_name = os.path.basename
+lock = None
+mother_root = None
+secondary_windows = 0
 
 def load_config():
     """Load settings from the config file."""
@@ -74,9 +70,14 @@ def load_config():
 
 def save_config(config):
     """Save settings safely using a temporary file to prevent corruption."""
-    fd, temp_path = tempfile.mkstemp(dir=SCRIPT_DIR, text=True)
+    # Clean the config JSON
+    for key in config.copy().keys():
+        if key not in DEFAULT_CONFIG:
+            del config[key]
+    
     try:
         # raise Exception(':P')
+        fd, temp_path = tempfile.mkstemp(dir=SCRIPT_DIR, text=True)
         with os.fdopen(fd, 'w', encoding=ENCODING) as f:
             json.dump(config, f, indent=4)
         os.replace(temp_path, CONFIG_FILE)
@@ -84,18 +85,39 @@ def save_config(config):
     except Exception as e:
         if path_exist(temp_path):
             os.remove(temp_path)
-        # showerror("Configuration Error", f"Failed to save settings!\nError: {e}")
         print(f'Failed to save config: {e}')
 
-# --- THE EDITOR ---
-def quick_text_editor(initial_path=None):
-    """Launch the quick graphical text editor."""
-    # Internal State
+def get_lock():
+    """Lock an internal program file to tell other instances to come here."""
+    try:
+        f = open(LOCK_FILE, 'w')
+        if SYSTEM == 'win32':
+            import msvcrt
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        # Success: We are the Primary
+        return f
+        
+    except Exception as e:
+        # Failure: We are the secondary, or someone else has the lock
+        print(f"Error: {e}\n(This is probably a second instance, so it's normal)")
+        return None
+
+# --- EDITOR ---
+class QuickTextEditor:
+    """The main window of the GUI editor with all of its widgets."""
+    # Config is applied for all instances
+    global config
     config = load_config()
+    
     geometry  = config['geometry']
     maximized = config['maximized']
-    font_priority = config['font_priority']
-    font_size = config['font_size']
+    text_font_priority = config['text_font_priority']
+    ui_font_priority = config['ui_font_priority']
+    text_font_size = config['text_font_size']
+    ui_font_size = config['ui_font_size']
     dark_mode = config['dark_mode']
     dark_bg = config['dark_bg']
     dark_fg = config['dark_fg']
@@ -103,28 +125,216 @@ def quick_text_editor(initial_path=None):
     light_fg = config['light_fg']
     indent_size = config['indent_size']
     max_undo = config['max_undo']
+    big_file_size = config['big_file_size']
     wrap = config['wrap']
+        
+    def __init__(self, initial_path=None, is_primary=True):
+        """Intialize the quick text editor attributes."""
+        # Instance-specific attributes
+        self.is_primary = is_primary
+        self.current_file_path = initial_path
+        self.initial_content_hash = None
+        self.editing_big_file = False
+        self.in_search_window = False
+        self.last_mtime = None
+        self.queue_check_interval = 128
+        self.external_check_interval = 1024
+        self.queue_check_id = None
+        self.external_check_id = None
+        self.closed = False
+        self.size_limit = self.big_file_size * 1024 * 1024
+        
+        # Shift the window a little bit if it's another instance
+        # if (not lock or not self.is_primary) or (INDEPENDENT_WINDOWS):
+        dimensions = self.geometry.replace('x', '+').split('+')
+        if len(dimensions) == 4:
+            from random import randint, choice
+            w, h, x, y = dimensions
+            shifted_x = int(x) + randint(5, 50) * choice([-1, 1])
+            shifted_y = int(y) + randint(5, 50) * choice([-1, 1])
+            self.geometry = f"{w}x{h}+{shifted_x}+{shifted_y}"
+        
+        # Load & Launch
+        self.setup_ui()
+        self.launch()
     
-    current_file_path = initial_path
-    initial_content_hash = None
-    editing_big_file = False
-    last_mtime = None
+    def setup_ui(self):
+        """Create and configure the window wigdtes (buttons, bars, etc)."""
+        global mother_root, secondary_windows, ui_font, text_font
+        # --- UI SETUP ---
+        if self.is_primary:
+            self.root = TkinterDnD.Tk()
+            self.root.report_callback_exception = self.handle_exception    # One for all
+            mother_root = self.root
+        else:
+            self.root = Toplevel(mother_root)
+            secondary_windows += 1
+            
+        self.root.geometry(self.geometry)
+        self.root.minsize(700, 150)
+        self.root.protocol('WM_DELETE_WINDOW', self.on_close)
+        if self.maximized:
+            try: self.root.state('zoomed')
+            except:
+                try: self.root.wm_state('zoomed')
+                except:
+                    try: self.root.attributes('-zoomed', True)
+                    except: pass
+        
+        # Font Type (Applied for all instances)
+        if self.is_primary:
+            text_font = next((f for f in self.text_font_priority if self.check_font_exists(f)), 'monospace')
+            text_font = [text_font, self.text_font_size]
+            ui_font = next((f for f in self.ui_font_priority if self.check_font_exists(f)), 'TkDefaultFont')
+            ui_font = [ui_font, self.ui_font_size]
+        
+        # Key Bindings
+        self.root.bind(f'<{PREFIX_KEY}-plus>', lambda e: self.change_font(1))
+        self.root.bind(f'<{PREFIX_KEY}-equal>', lambda e: self.change_font(1))
+        self.root.bind(f'<{PREFIX_KEY}-minus>', lambda e: self.change_font(-1))
+        self.root.bind(f'<{PREFIX_KEY}-n>', self.new_file)
+        self.root.bind(f'<{PREFIX_KEY}-o>', self.open_file)
+        self.root.bind(f'<{PREFIX_KEY}-s>', self.save_file)
+        self.root.bind(f'<{PREFIX_KEY}-Shift-s>', self.save_file_as)
+        self.root.bind(f'<{PREFIX_KEY}-w>', self.toggle_wrap)
+        self.root.bind(f'<{PREFIX_KEY}-t>', self.toggle_theme)
+        self.root.bind(f'<{PREFIX_KEY}-f>', self.open_search)
 
+        # Top Bar
+        self.top_frame = Frame(self.root)
+        self.top_frame.pack(fill=X)
+
+        # Left Side Buttons
+        self.new_btn = Button(self.top_frame, text='📄 New', font=ui_font, command=self.new_file, relief=FLAT)
+        self.open_btn = Button(self.top_frame, text='📂 Open', font=ui_font, command=self.open_file, relief=FLAT)
+        self.save_btn = Button(self.top_frame, text='💾 Save', font=ui_font, command=self.save_file, relief=FLAT)
+        self.save_as_btn = Button(self.top_frame, text='💾 Save As', font=ui_font, command=self.save_file_as, relief=FLAT)
+        
+        self.new_btn.pack(side=LEFT, padx=(6, 2), pady=6)
+        self.open_btn.pack(side=LEFT, padx=2)
+        self.save_btn.pack(side=LEFT, padx=2)
+        self.save_as_btn.pack(side=LEFT, padx=2)
+
+        # Right Side Buttons
+        self.theme_btn = Button(self.top_frame, text='🌙 Dark', font=ui_font, command=self.toggle_theme, relief=FLAT)
+        self.wrap_btn = Button(self.top_frame, text='⤶ Wrap', font=ui_font, command=self.toggle_wrap, relief=FLAT)
+        self.shortcuts_btn = Button(self.top_frame, text='⌨ Shortcuts', font=ui_font, command=self.show_shortcuts, relief=FLAT)
+        self.plus_btn = Button(self.top_frame, text='A⁺', font=ui_font, command=lambda: self.change_font(+1), relief=FLAT)
+        self.minus_btn = Button(self.top_frame, text='A⁻', font=ui_font, command=lambda: self.change_font(-1), relief=FLAT)
+        self.search_btn = Button(self.top_frame, text='🔍 Find', font=ui_font, command=self.open_search, relief=FLAT)
+        
+        self.minus_btn.pack(side=RIGHT, padx=(2, 6), pady=6)
+        self.plus_btn.pack(side=RIGHT, padx=2)
+        self.shortcuts_btn.pack(side=RIGHT, padx=2)
+        self.theme_btn.pack(side=RIGHT, padx=2)
+        self.wrap_btn.pack(side=RIGHT, padx=2)
+        self.search_btn.pack(side=RIGHT, padx=2)
+
+        # Text Area
+        self.text_frame = Frame(self.root)
+        self.text_frame.pack(expand=True, fill=BOTH)
+        self.text_field = Text(self.text_frame, wrap='none', font=text_font, relief=FLAT, undo=True, maxundo=self.max_undo)
+        self.h_scrollbar = Scrollbar(self.text_frame, orient='horizontal', command=self.text_field.xview)
+        self.text_field.config(xscrollcommand=self.update_h_scrollbar)
+        self.text_field.grid(row=0, column=0, sticky='nsew')
+        self.h_scrollbar.grid(row=1, column=0, sticky='ew')
+
+        self.text_field.focus_set()
+        self.text_field.drop_target_register(DND_FILES)
+        self.text_field.dnd_bind('<<Drop>>', self.handle_drop)
+        # This command might be needed in linux for drag&drop: sudo apt-get install tk-dev
+        
+        self.text_field.unbind_class("Text", f"<{PREFIX_KEY}-o>")
+        self.text_field.unbind_class("Text", f"<{PREFIX_KEY}-t>")
+        self.text_field.unbind_class("Text", f"<{PREFIX_KEY}-s>")
+        self.text_field.unbind_class("Text", f"<{PREFIX_KEY}-n>")
+        self.text_field.unbind_class("Text", f"<{PREFIX_KEY}-w>")
+        self.text_field.unbind_class("Text", f"<{PREFIX_KEY}-plus>")
+        self.text_field.unbind_class("Text", f"<{PREFIX_KEY}-equal>")
+        self.text_field.unbind_class("Text", f"<{PREFIX_KEY}-minus>")
+        self.text_field.bind(f'<{PREFIX_KEY}-BackSpace>', self.on_ctrl_backspace)
+        self.text_field.bind(f'<{PREFIX_KEY}-Delete>', self.on_ctrl_delete)
+        self.text_field.bind(f'<{PREFIX_KEY}-x>', self.on_ctrl_x)
+        self.text_field.bind(f'<{PREFIX_KEY}-c>', self.on_ctrl_c)
+        self.text_field.bind('<Tab>', self.on_tab)
+        self.text_field.bind('<Shift-Tab>', self.on_shift_tab)
+        self.text_field.bind(f'<{PREFIX_KEY}-a>', self.on_ctrl_a)
+        self.text_field.bind(f'<{PREFIX_KEY}-d>', self.on_ctrl_d)
+
+        self.v_scrollbar = Scrollbar(self.text_frame, command=self.text_field.yview)
+        self.v_scrollbar.grid(row=0, column=1, sticky='ns')
+        self.text_frame.grid_columnconfigure(0, weight=1)
+        self.text_frame.grid_rowconfigure(0, weight=1)
+        self.text_field.config(yscrollcommand=self.update_v_scrollbar)
+        
+        # Final touches
+        if self.wrap: self.toggle_wrap()
+        self.apply_theme()
+        self.set_title()
+    
+    def launch(self):
+        """Launch the window with a file (if any)."""
+        # Open file if available and hash it
+        if self.current_file_path and path_exist(self.current_file_path):
+            state = self.load_file_into_editor(self.current_file_path)
+            if state is not True:
+                print(f"Startup file load error: {state}")
+                self.root.after(256, lambda: showerror("File Opening Error", f"Error opening file: {state}", parent=self.root))
+                self.current_file_path = None
+                
+        elif self.current_file_path and not path_exist(self.current_file_path):
+            # Use a temporary path variable to avoid scheduled 'file deleted' popup when focusing on error dialog
+            rejected_path = self.current_file_path
+            self.current_file_path = None
+            if not path_exist(rejected_path):
+                # Schedule the error to appear after 256ms so it's well attached to the main window
+                self.root.after(256, lambda: showerror("File Load Error", f"'{rejected_path}' doesn't exist!", parent=self.root))
+        
+        # Start
+        if self.is_primary:
+            self.queue_check_id = self.root.after(self.queue_check_interval, self.check_queue)
+            self.external_check_id = self.root.after(self.external_check_interval, self.check_external_modification)
+            try: self.root.mainloop()
+            except (KeyboardInterrupt, EOFError): print("Editor closed via terminal interruption.")
+         
+    def handle_exception(self, exc, val, tb):
+        """Handle internal Tk errors without freezing the app."""
+        import traceback
+        # Check for manual interruption or EOF
+        if issubclass(exc, (KeyboardInterrupt, EOFError)):
+            print("\nUser requested termination.")
+            self.root.destroy()
+            return 'break'
+        # Show error instead of breaking the app
+        err = ''.join(traceback.format_exception(exc, val, tb))
+        print(f"\nInternal Error Caught:\n{err}")
+        showerror("Internal Error", f"An unexpected error occurred:\n{val}", parent=self.root)
+
+    def check_font_exists(self, font_name):
+        """Check if the given font type exist in the system."""
+        # Instead of loading the entire system font, let Tk ask the system for one font at a time
+        actual_family = font.Font(family=font_name).actual("family")
+        return actual_family.lower() == font_name.lower()
+   
     # --- ACTIONS ---
-    def show_shortcuts():
-        win = Toplevel(root)
+    def show_shortcuts(self):
+        """Show a simple dialog containing useful keyboard shortcuts."""
+        # Create a separate window
+        win = Toplevel(self.root)
         win.title('Keyboard Shortcuts')
         win.resizable(False, False)
-        win.transient(root)
+        win.transient(self.root)
         win.grab_set()
+        win.focus_set()
 
-        bg = '#020617' if dark_mode else '#ffffff'
-        fg = '#e5e7eb' if dark_mode else '#000000'
+        bg = '#020617' if self.dark_mode else '#ffffff'
+        fg = '#e5e7eb' if self.dark_mode else '#000000'
         win.configure(bg=bg)
         
+        # Prepare shortcuts text
         shortcuts_text = (
             'Ctrl-N          →  New File\n'
-            'Ctrl-O          →  Open File\n'
+            'Ctrl-O          →  Open File(s)\n'
             'Ctrl-S          →  Save File\n'
             'Ctrl-Shift-S    →  Save File As\n'
             'Ctrl-T          →  Toggle Theme\n'
@@ -143,632 +353,819 @@ def quick_text_editor(initial_path=None):
         )
         if SYSTEM == 'darwin':
             shortcuts_text = shortcuts_text.replace('Ctrl-', '⌘-')
-
-        label = Label(win, text=shortcuts_text, justify='left', font=(text_font[0], 12),
+        
+        # Create button & label
+        label = Label(win, text=shortcuts_text, justify='left', font=(text_font[0], ui_font[1]),
                       bg=bg, fg=fg, padx=20, pady=16)
         button = Button(win, text='Close', command=win.destroy, font=ui_font,
-                        relief=FLAT, bg='#1e293b' if dark_mode else '#e5e7eb', fg=fg, padx=12, pady=4)
+                        relief=FLAT, bg='#1e293b' if self.dark_mode else '#e5e7eb', fg=fg, padx=12, pady=4)
         
         label.pack()
         button.pack(pady=(0, 12))
         
+        # Center the window
         win.update_idletasks()
-        x = root.winfo_rootx() + (root.winfo_width() - win.winfo_width()) // 2
-        y = root.winfo_rooty() + (root.winfo_height() - win.winfo_height()) // 2
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - win.winfo_width()) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - win.winfo_height()) // 2
         win.geometry(f'+{x}+{y}')
 
-    def on_ctrl_backspace(event):
-        text_field.delete(text_field.index('insert -1c wordstart'), 'insert')
+    def on_ctrl_backspace(self, event):
+        """Handle CTRL-BACKSPACE."""
+        # Delete previous word
+        self.text_field.delete(self.text_field.index('insert -1c wordstart'), 'insert')
         return 'break'
 
-    def on_ctrl_delete(event):
-        text_field.delete('insert', 'insert wordend')
+    def on_ctrl_delete(self, event):
+        """Handle CTRL-DELETE."""
+        # Delete next word
+        self.text_field.delete('insert', 'insert wordend')
         return 'break'
     
-    def on_ctrl_a(event):
-        text_field.tag_add('sel', '1.0', 'end-1c')
+    def on_ctrl_a(self, event):
+        """Handle CTRL-A."""
+        # Select all text
+        self.text_field.tag_add('sel', '1.0', 'end-1c')
         return 'break'
     
-    def on_ctrl_x(event):
-        if not text_field.tag_ranges('sel'):
-            line_start, line_end = text_field.index('insert linestart'), text_field.index('insert lineend +1c')
-            root.clipboard_clear()
-            root.clipboard_append(text_field.get(line_start, line_end))
-            text_field.delete(line_start, line_end)
+    def on_ctrl_x(self, event):
+        """Handle CTRL-X."""
+        if not self.text_field.tag_ranges('sel'):
+            # Cut the entire line
+            line_start, line_end = self.text_field.index('insert linestart'), self.text_field.index('insert lineend +1c')
+            text_to_cut = self.text_field.get(line_start, line_end)
+            if not text_to_cut: return
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text_to_cut)
+            self.text_field.delete(line_start, line_end)
         else:
-            text_field.event_generate('<<Cut>>')
+            # Cut selection
+            self.text_field.event_generate('<<Cut>>')
         return 'break'
 
-    def on_ctrl_c(event):
-        if not text_field.tag_ranges('sel'):
-            root.clipboard_clear()
-            root.clipboard_append(text_field.get('insert linestart', 'insert lineend +1c'))
+    def on_ctrl_c(self, event):
+        """Handle CTRL-C."""
+        if not self.text_field.tag_ranges('sel'):
+            # Copy the entire line
+            self.root.clipboard_clear()
+            self.root.clipboard_append(self.text_field.get('insert linestart', 'insert lineend +1c'))
         else:
-            text_field.event_generate('<<Copy>>')
+            # Copy selection
+            self.text_field.event_generate('<<Copy>>')
         return 'break'
 
-    def on_ctrl_d(event):
+    def on_ctrl_d(self, event):
+        """Handle CTRL-D."""
         try:
             # If text is selected, duplicate the selection
-            start, end = text_field.index("sel.first"), text_field.index("sel.last")
-            content = text_field.get(start, end)
-            text_field.insert(end, content)
+            start, end = self.text_field.index("sel.first"), self.text_field.index("sel.last")
+            content = self.text_field.get(start, end)
+            self.text_field.insert(end, content)
         except:
             # Otherwise, duplicate current line
-            line_start = text_field.index('insert linestart')
-            line_end = text_field.index('insert lineend')
-            line_content = text_field.get(line_start, line_end)
-            text_field.insert(f"{line_end}", f"\n{line_content}")
+            line_start = self.text_field.index('insert linestart')
+            line_end = self.text_field.index('insert lineend')
+            line_content = self.text_field.get(line_start, line_end)
+            self.text_field.insert(f"{line_end}", f"\n{line_content}")
         return 'break'
 
-    def on_tab(event):
+    def on_tab(self, event):
+        """Handle pressing TAB by inserting spaces instead."""
         try:
             # Get range of selected lines
-            start_line = int(text_field.index("sel.first").split('.')[0])
-            end_line = int(text_field.index("sel.last").split('.')[0])
+            start_line = int(self.text_field.index("sel.first").split('.')[0])
+            end_line = int(self.text_field.index("sel.last").split('.')[0])
             
             for i in range(start_line, end_line + 1):
-                text_field.insert(f"{i}.0", ' ' * indent_size)
+                self.text_field.insert(f"{i}.0", ' ' * self.indent_size)
         except:
             # No selection, just insert spaces at cursor
-            text_field.insert('insert', ' ' * indent_size)
+            self.text_field.insert('insert', ' ' * self.indent_size)
         return 'break'
 
-    def on_shift_tab(event):
+    def on_shift_tab(self, event):
+        """Handle SHIFT-TAB by unindenting lines(s)."""
         try:
             # Determine range: selected lines or just current line
-            if text_field.tag_ranges("sel"):
-                start_line = int(text_field.index("sel.first").split('.')[0])
-                end_line = int(text_field.index("sel.last").split('.')[0])
+            if self.text_field.tag_ranges("sel"):
+                start_line = int(self.text_field.index("sel.first").split('.')[0])
+                end_line = int(self.text_field.index("sel.last").split('.')[0])
             else:
-                start_line = end_line = int(text_field.index("insert").split('.')[0])
+                start_line = end_line = int(self.text_field.index("insert").split('.')[0])
 
             for i in range(start_line, end_line + 1):
-                line_start = f"{i}.0"
                 # Check for spaces at the start of the line
-                content = text_field.get(line_start, f"{line_start} + {indent_size}c")
-                if content.startswith(' '):
+                line_start = f"{i}.0"
+                content = self.text_field.get(line_start, f"{line_start}+{self.indent_size}c")
+                if content.startswith((' ', '\t')):
                     # Remove up to indent_size leading spaces
-                    num_to_del = len(content) - len(content.lstrip(' '))
-                    text_field.delete(line_start, f"{line_start} + {num_to_del}c")
+                    num_to_del = len(content) - len(content.lstrip(' ').lstrip('\t'))
+                    self.text_field.delete(line_start, f"{line_start}+{num_to_del}c")
         except Exception as e:
             print(f"Shift-Tab error: {e}")
         return 'break'
         
-    def change_font(delta):
-        nonlocal font_size, text_font
-        if font_size <= 12: step = 1
-        elif font_size <= 24: step = 2
-        elif font_size <= 48: step = 4
+    def change_font(self, delta):
+        """Increase/decrease text field font size."""
+        global text_font
+        # Determine font size jump step
+        if self.text_font_size <= 12: step = 1
+        elif self.text_font_size <= 24: step = 2
+        elif self.text_font_size <= 48: step = 4
         else: step = 8
-        new_size = font_size + delta * step
+        new_size = self.text_font_size + delta * step
+        # Restrict to min/max size
         new_size = min(96, new_size)
         new_size = max(7, new_size)
-        if 7 <= new_size <= 96 and new_size != font_size:
-            font_size = new_size
-            text_font[-1] = font_size
-            text_field.config(font=text_font)
+        if 7 <= new_size <= 96 and new_size != self.text_font_size:
+            self.text_font_size = new_size
+            text_font[-1] = self.text_font_size
+            self.text_field.config(font=text_font)
 
-    def update_v_scrollbar(*args):
-        size = text_field.yview()
+    def update_v_scrollbar(self, *args):
+        """Show/hide the vertical scrollbar."""
+        # Show v-scrollbar for vertically long text, otherwise hide
+        size = self.text_field.yview()
         if size == (0.0, 1.0):
-            v_scrollbar.grid_remove()
+            self.v_scrollbar.grid_remove()
         else:
-            v_scrollbar.set(*size)
-            v_scrollbar.grid() 
+            self.v_scrollbar.set(*size)
+            self.v_scrollbar.grid() 
 
-    def update_h_scrollbar(*args):
-        size = text_field.xview()
-        if size == (0.0, 1.0) or text_field.cget('wrap') != 'none':
-            h_scrollbar.grid_remove()
+    def update_h_scrollbar(self, *args):
+        """Show/hide the horizontal scrollbar."""
+        # Show h-scrollbar for horizontally long text, otherwise hide
+        size = self.text_field.xview()
+        if size == (0.0, 1.0) or self.text_field.cget('wrap') != 'none':
+            self.h_scrollbar.grid_remove()
         else:
-            h_scrollbar.set(*size)
-            h_scrollbar.grid()
+            self.h_scrollbar.set(*size)
+            self.h_scrollbar.grid()
             
-    def apply_theme():
+    def apply_theme(self):
+        """Apply dark/light theme colors to widgets."""
+        # Determine the buttons to change their colors
         buttons = (
-            new_btn, open_btn, save_btn, save_as_btn, shortcuts_btn, plus_btn,
-            minus_btn, wrap_btn, search_btn, theme_btn,
+            self.new_btn, self.open_btn, self.save_btn, self.save_as_btn, self.shortcuts_btn, self.plus_btn,
+            self.minus_btn, self.wrap_btn, self.search_btn, self.theme_btn,
         )
         
-        if dark_mode:
-            root.config(bg='#0f172a')
-            top_frame.config(bg='#243B49')
-            text_field.config(bg=dark_bg, fg=dark_fg, insertbackground='#e5e7eb')
-            theme_btn.config(text='☀ Light')
+        if self.dark_mode:
+            # Switch to dark theme
+            self.root.config(bg='#0f172a')
+            self.top_frame.config(bg='#243B49')
+            self.text_field.config(bg=self.dark_bg, fg=self.dark_fg, insertbackground='#e5e7eb')
+            self.theme_btn.config(text='☀ Light')
             for btn in buttons:
                 btn.config(bg='#212121', fg='#e5e7eb', activebackground='#334155')
         else:
-            root.config(bg='#f8fafc')
-            top_frame.config(bg='#2d5ac4')
-            text_field.config(bg=light_bg, fg=light_fg, insertbackground='black')
-            theme_btn.config(text='🌙 Dark')
+            # Switch to light theme
+            self.root.config(bg='#f8fafc')
+            self.top_frame.config(bg='#2d5ac4')
+            self.text_field.config(bg=self.light_bg, fg=self.light_fg, insertbackground='black')
+            self.theme_btn.config(text='🌙 Dark')
             for btn in buttons:
                 btn.config(bg='#e5e7eb', fg='black', activebackground='#d1d5db')
 
-    def toggle_theme(event=None):
-        nonlocal dark_mode
-        dark_mode = not dark_mode
-        apply_theme()
+    def toggle_theme(self, event=None):
+        """Toggle current theme by inverting the dark_mode state."""
+        # Change theme & apply it
+        self.dark_mode = not self.dark_mode
+        self.apply_theme()
+        return 'break'
     
-    def toggle_wrap(event=None):
-        nonlocal wrap
-        if text_field.cget('wrap') == 'none':
-            text_field.config(wrap='word')
-            wrap_btn.config(text='⇉ Unwrap')
+    def toggle_wrap(self, event=None):
+        """Wrap/unwrap text field content."""
+        if self.text_field.cget('wrap') == 'none':
+            # Turn ON word-wrap
+            self.text_field.config(wrap='word')
+            self.wrap_btn.config(text='⇉ Unwrap')
         else:
-            text_field.config(wrap='none')
-            wrap_btn.config(text='⤶ Wrap')
-        update_h_scrollbar()
-        wrap = not wrap
+            # Turn OFF word-wrap
+            self.text_field.config(wrap='none')
+            self.wrap_btn.config(text='⤶ Wrap')
+        # Show h-scrollbar if word-wrap is OFF, otherwise hide it
+        self.update_h_scrollbar()
+        self.wrap = not self.wrap
     
-    def open_search(event=None):
-        search_win = Toplevel(root)
+    def open_search(self, event=None):
+        """Open a small dialog to search for a word."""
+        if self.in_search_window:
+            # Forbid opening more than one search window
+            return
+        if self.editing_big_file:
+            showerror("Search Disabled", f"Search feature is disabled for big files. I apologize because " \
+                      "I'm still looking for a way to enable it without freezing the app. I hope you understand ;-;",
+                      icon='question', parent=self.root)
+            return
+        self.in_search_window = True
+            
+        # Create a small new window
+        search_win = Toplevel(self.root)
         search_win.title('Find')
         search_win.attributes('-topmost', True)
-        search_win.transient(root)
+        search_win.transient(self.root)
         search_win.minsize(300, 55)
         
         win_w, win_h = 350, 60
         search_win.minsize(300, 55)
         
-        root.update_idletasks()
-        x = root.winfo_rootx() + (root.winfo_width() - win_w) // 2
-        y = root.winfo_rooty() + (root.winfo_height() - win_h) // 2
-        search_win.geometry(f'{win_w}x{win_h}+{x}+{y}')
-        
-        bg = dark_bg if dark_mode else light_bg
-        fg = dark_fg if dark_mode else light_fg
+        bg = self.dark_bg if self.dark_mode else self.light_bg
+        fg = self.dark_fg if self.dark_mode else self.light_fg
         search_win.configure(bg=bg, padx=10, pady=10)
-
-        entry = Entry(search_win, font=(text_font[0], 12), bg=bg, fg=fg, insertbackground=fg, highlightbackground=fg, highlightthickness=1, bd=0)
+        
+        # Create a small label to type the search term
+        entry = Entry(search_win, font=ui_font, bg=bg, fg=fg, insertbackground=fg, highlightbackground=fg, highlightthickness=1, bd=0)
         entry.pack(side=LEFT, padx=5, ipady=5, fill=X, expand=True)
         entry.focus_set()
 
         def on_search_close():
-            text_field.tag_remove('found', '1.0', END)
+            # Clear highlighting & close
+            self.text_field.tag_remove('found', '1.0', END)
             search_win.destroy()
+            self.in_search_window = False
 
         search_win.protocol("WM_DELETE_WINDOW", on_search_close)
-        text_field.tag_config('found', background='#eab308', foreground='black')
+        self.text_field.tag_config('found', background='#eab308', foreground='black')
 
         def find_text(*_):
+            # Highlight matches
             query = entry.get()
-            text_field.tag_remove('found', '1.0', END)
+            self.text_field.tag_remove('found', '1.0', END)
             if not query: return
             match_len = IntVar()
             idx = '1.0'
             while True:
-                idx = text_field.search(query, idx, nocase=1, stopindex=END, count=match_len)
+                idx = self.text_field.search(query, idx, nocase=1, stopindex=END, count=match_len)
                 if not idx: break
                 lastidx = f"{idx}+{match_len.get()}c"
-                text_field.tag_add('found', idx, lastidx)
+                self.text_field.tag_add('found', idx, lastidx)
                 idx = lastidx
-
+        
+        # Create a button
         find_btn = Button(search_win, text='Find All', command=find_text, font=ui_font, bg=bg, fg=fg, relief=FLAT)
         find_btn.pack(side=LEFT)
-        if dark_mode: find_btn.config(bg='#1e293b', fg='#e5e7eb', activebackground='#334155')
+        if self.dark_mode: find_btn.config(bg='#1e293b', fg='#e5e7eb', activebackground='#334155')
         else: find_btn.config(bg='#e5e7eb', fg='black', activebackground='#d1d5db')
         entry.bind('<Return>', find_text)
-    
-    def handle_exception(exc, val, tb):
-        import traceback
-        err = ''.join(traceback.format_exception(exc, val, tb))
-        print(f"\nInternal Error Caught:\n{err}")
-        showerror("Internal Error", f"An unexpected error occurred:\n{val}")
-
-    def check_font_exists(font_name):
-        actual_family = font.Font(family=font_name).actual("family")
-        return actual_family.lower() == font_name.lower()
+        
+        # Center the small window
+        self.root.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - win_w) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - win_h) // 2
+        search_win.geometry(f'{win_w}x{win_h}+{x}+{y}')
 
     # --- FILE HANDLING ---
-    def set_title():
-        name = base_name(current_file_path) if current_file_path else "Untitled"
-        root.title(f"{name} - Quick Text Editor")
-    
-    def check_file_size(path):
-        nonlocal editing_big_file
-        was_editing_big_file = bool(editing_big_file)
-        editing_big_file = False
-        size_limit = 4 * 1024 * 1024
-        file_size = os.path.getsize(path)
+    def check_queue(self):
+        """Check if other instances requested opening file(s)."""
+        global lock
+        if not self.is_primary: return
+        if INDEPENDENT_WINDOWS: return
+        if self.closed: return
         
-        if file_size > size_limit:
-            size_mb = int(file_size / (1024 * 1024))
-            response = askyesno(
-                "Big File Warning", 
-                f"The file is {size_mb} MB. Opening large files may cause the editor to freeze.\n\nContinue anyway?",
-                default='no',
-                icon='warning',
-                parent=root,
-            )
-            if response is True: editing_big_file = True
-            else: editing_big_file = was_editing_big_file
-            return response
-        return True
-    
-    def handle_drop(event):
-        nonlocal current_file_path
-        path = event.data.strip('{}')
-        if not os.path.isfile(path):
-            return
-
-        # Confirm dropping
-        current_content = text_field.get('1.0', 'end-1c')
-        if is_modified():
-            response = askyesno(
-                "Confirm",
-                f"Discard changes and open '{base_name(path)}'?",
-                default='no',
-                parent=root,
-            )
-            if not response: return
-        
-        if not check_file_size(path): return
-        try:
-            with open(path, 'r', encoding=ENCODING, errors=ENCODING_ERROR_HANDLER) as f:
-                content = f.read()
-            text_field.delete('1.0', END)
-            text_field.insert('1.0', content)
-            text_field.mark_set("insert", "1.0")
-            text_field.see("1.0")
-            text_field.edit_reset()
-            current_file_path = path
-            update_mtime()
-            update_initial_hash()
-            set_title()
-        except Exception as e:
-            print(f"Drop error: {e}")
-    
-    def new_file(event=None):
-        nonlocal current_file_path
-        if is_modified():
-            response = askyesno(
-                "Confirm",
-                "Discard current text and start new?",
-                default='no',
-                parent=root,
-            )
-            if not response: return
-        
-        text_field.delete('1.0', END)
-        text_field.edit_reset()
-        current_file_path = None
-        update_mtime()
-        update_initial_hash()
-        set_title()
-
-    def open_file(event=None):
-        nonlocal current_file_path, editing_big_file
-        if is_modified():
-            response = askyesno(
-                "Confirm",
-                "Discard current text and open another file?",
-                default='no',
-                parent=root,
-            )
-            if not response: return
-        
-        path = askopenfilename()
-        if path and check_file_size(path):
+        # Check if another instance requested opening a file
+        if os.path.exists(QUEUE_FILE):    # If it exists, a queue is confirmed
             try:
-                with open(path, 'r', encoding=ENCODING, errors=ENCODING_ERROR_HANDLER) as f:
-                    content = f.read()
-                text_field.delete('1.0', END)
-                text_field.insert('1.0', content)
-                text_field.mark_set("insert", "1.0")
-                text_field.see("1.0")
-                text_field.edit_reset()
-                current_file_path = path
-                update_mtime()
-                update_initial_hash()
-                set_title()
-            except Exception as e:
-                print(f"Error opening file: {e}")
-
-    def save_file(event=None):
-        nonlocal current_file_path
-        if not current_file_path:
-            current_file_path = asksaveasfilename(
-                initialfile=(text_field.get('1.0', 'end-1c').strip().split() or ['Text'])[0],
-                defaultextension='.txt',
-                filetypes=[('Plain Text', '*.txt'), ('All files', '*.*')],
-                title='Save As'
-            )
-        
-        if current_file_path:
-            try:
-                content = text_field.get('1.0', 'end-1c')
                 # raise Exception(':P')
-                with open(current_file_path, 'w', encoding=ENCODING, errors=ENCODING_ERROR_HANDLER) as f:
-                    f.write(content)
-                update_mtime()
-                update_initial_hash()
-                set_title()
-                return True
+                with open(QUEUE_FILE, 'r', encoding=ENCODING, errors=ENCODING_ERROR_HANDLER) as q:
+                    paths = q.read().splitlines()
+                os.remove(QUEUE_FILE)
+                for p in paths:
+                    # Open as Toplevel instead of root
+                    QuickTextEditor(p, is_primary=False)
+                    
             except Exception as e:
-                print(f"Error saving file: {e}")
-                showerror("File Save Error", f"Could not save file:\n{e}")
-                return False
-    
-    def save_file_as(event=None):
-        nonlocal current_file_path
-        old_path = current_file_path
-        current_file_path = None         # Force the dialog in save_file()
-        if not save_file():
-            current_file_path = old_path # Restore if user cancels
-    
-    def get_content_hash():
-        if editing_big_file: return None
-        return hash(text_field.get('1.0', 'end-1c'))
-
-    def update_initial_hash(from_file=False):
-        nonlocal initial_content_hash
-        if from_file and path_exist(current_file_path) and not editing_big_file:
-            with open(current_file_path, 'r', encoding=ENCODING, errors=ENCODING_ERROR_HANDLER) as f:
-                initial_content_hash = hash(f.read())
-        else:
-            initial_content_hash = get_content_hash()
-    
-    def update_mtime():
-        nonlocal last_mtime
-        if current_file_path and path_exist(current_file_path):
-            last_mtime = os.path.getmtime(current_file_path)
-        else:
-            last_mtime = 0
-    
-    def is_modified():
-        if editing_big_file: return True
-        if not current_file_path:
-            current_text = text_field.get('1.0', 'end-1c')
-            return bool(current_text)
-        else:
-            return get_content_hash() != initial_content_hash
-              
-    def check_external_modification(event=None):
-        nonlocal current_file_path, last_mtime
-        # This is a draft, no need to check
-        if not current_file_path:
+                import subprocess
+                print(f'Error reading/removing queue file: {e}')
+                print('Switched to slow free-instance mode, where each program instance has its own memory allocation.')
+                # Release the lock and allow other instances to launch direcly as primary
+                if hasattr(lock, 'close'): lock.close()
+                lock = None
+                save_config({**config, 'independent_windows': True})
+                # Relaunch as a primary instance
+                executable = sys.executable
+                is_compiled = getattr(sys, 'frozen', False)
+                if self.current_file_path: arg = os.path.abspath(self.current_file_path)
+                else: arg = ''
+                if is_compiled: args = [executable, arg]     # app.bin file.txt
+                else: args = [executable, sys.argv[0], arg]  # python script.py file.txt
+                subprocess.Popen(args)
+                
+        # Tell the main loop to open it after 0.5s
+        if lock:
+            self.queue_check_id = self.root.after(self.queue_check_interval, self.check_queue)
+         
+    def check_external_modification(self, event=None):
+        """Check if currently opened file was edited/deleted externally."""
+        # This is a draft or a big file, no need to check
+        if self.editing_big_file or self.closed: return
+        if not self.current_file_path:
+            self.external_check_id = self.root.after(self.external_check_interval, self.check_external_modification)
             return
         
         # Check if it's been deleted.
-        elif not path_exist(current_file_path):
+        elif not path_exist(self.current_file_path):
             # Temporarily clear path to prevent scheduled FocusIn loops while y/n dialog is focused
-            temp_path = current_file_path
-            current_file_path = None
-            last_mtime = 0
+            temp_path = self.current_file_path
+            self.current_file_path = None
+            self.last_mtime = 0
             msg = f"'{base_name(temp_path)}' has been deleted externally.\n\nSave now?"
-            
+            # Ask to re-save deleted file
             response = askyesno(
                 "File Deleted",
                 msg,
                 icon='warning',
                 default='yes',
-                parent=root,
+                parent=self.root,
             )
             if response is True:
-                current_file_path = temp_path
-                if save_file():
-                    update_mtime()
-                    update_initial_hash()
+                # Re-write saved file
+                self.current_file_path = temp_path
+                if self.save_file():
+                    self.update_mtime()
+                    self.update_initial_hash()
                 else:
-                    current_file_path = None
-                
-            set_title()
+                    self.current_file_path = None
+            self.set_title()
+            self.external_check_id = self.root.after(self.external_check_interval, self.check_external_modification)
             return
         
         # Check if it's been modified.
-        try: current_mtime = os.path.getmtime(current_file_path)
-        except: return
+        try:
+            current_mtime = os.path.getmtime(self.current_file_path)
+        except:
+            self.external_check_id = self.root.after(self.external_check_interval, self.check_external_modification)
+            return
         
-        if last_mtime and current_mtime > last_mtime:
-            last_mtime = current_mtime
-            msg = f"'{base_name(current_file_path)}' was modified externally."
+        if self.last_mtime and current_mtime > self.last_mtime:
+            self.last_mtime = current_mtime
+            msg = f"'{base_name(self.current_file_path)}' was modified externally."
             icon = 'question'
             
-            if is_modified():
+            if self.is_modified():
                 msg += "\n\nWARNING: You have unsaved changes in the editor. Reloading will overwrite them!"
                 icon = 'warning'
             
+            # Ask to reload from file
             response = askyesno(
                 "File Conflict",
                 f"{msg}\n\nReload from disk?",
                 icon=icon,
                 default='yes',
-                parent=root,
+                parent=self.root,
             )
             
             if response:
                 try:
-                    with open(current_file_path, 'r', encoding=ENCODING, errors=ENCODING_ERROR_HANDLER) as f:
+                    with open(self.current_file_path, 'r', encoding=ENCODING, errors=ENCODING_ERROR_HANDLER) as f:
                         content = f.read()
                     # Realod, save to undo stack, and scroll up
                     # Here is a bug of scrolling to bottom when clicking Ctrl-Z
-                    text_field.config(autoseparators=False)
-                    text_field.edit_separator()
-                    text_field.delete('1.0', END)
-                    text_field.insert('1.0', content)
-                    text_field.edit_separator()
-                    text_field.config(autoseparators=True)
-                    text_field.mark_set("insert", "1.0")
-                    text_field.see("1.0")
-                    update_initial_hash()
+                    self.text_field.config(autoseparators=False)
+                    self.text_field.edit_separator()
+                    self.text_field.delete('1.0', END)
+                    self.text_field.insert('1.0', content)
+                    self.text_field.edit_separator()
+                    self.text_field.config(autoseparators=True)
+                    self.text_field.mark_set("insert", "1.0")
+                    self.text_field.see("1.0")
+                    self.update_initial_hash()
                     
                 except Exception as e:
                     print(f"Reload error: {e}")
-                    showerror("File Reload Error", f"Could not reload file:\n{e}")
+                    showerror("File Reload Error", f"Could not reload file:\n{e}", parent=self.root)
             else:
                 # Initial hash becomes the modified file hash
-                update_initial_hash(from_file=True)
+                self.update_initial_hash(from_file=True)
+        self.external_check_id = self.root.after(self.external_check_interval, self.check_external_modification)
+        
+    def check_file_size(self, path):
+        """Check if the chosen file is big or not."""
+        # Check if the chosen file is big
+        was_editing_big_file = bool(self.editing_big_file)
+        self.editing_big_file = False
+        file_size = os.path.getsize(path)
+        
+        # Ask before opening it
+        if file_size > self.size_limit:
+            size_mb = int(file_size / (1024 * 1024))
+            response = askyesno(
+                "Big File Warning", 
+                f"The file is {size_mb} MB. Opening large files may cause the editor to freeze, and some features will be disabled.\n\nContinue anyway?",
+                default='no',
+                icon='warning',
+                parent=self.root,
+            )
+            if response is True: self.editing_big_file = True
+            else: self.editing_big_file = was_editing_big_file
+            return response
+        return True
+         
+    def load_file_into_editor(self, path):
+        """Helper to load content into the current text field."""
+        if not self.check_file_size(path): 
+            return True
+        try:
+            with open(path, 'r', encoding=ENCODING, errors=ENCODING_ERROR_HANDLER) as f:
+                content = f.read()
+        except Exception as e:
+            return e
+        else:
+            if not self.editing_big_file: self.initial_content_hash = hash(content)
+            self.text_field.edit_reset()
+            self.text_field.delete('1.0', END)
+            self.text_field.insert('1.0', content)
+            del content
+            self.text_field.mark_set("insert", "1.0")
+            self.text_field.see("1.0")
+            self.text_field.edit_reset()
+            self.text_field.config(undo=not self.editing_big_file)
+            self.current_file_path = path
+            self.update_mtime()
+            self.set_title()
+            return True
+       
+    def handle_drop(self, event):
+        """Close current file/draft and open dragged & dropped files."""
+        # TkinterDnD2 returns multiple files as a brace-enclosed string
+        paths = self.root.tk.splitlist(event.data)
+        if not paths: return
+
+        # Handle the first file in the current window
+        first_path = paths[0]
+        if os.path.isfile(first_path):
+            # Confirm dropping if the current window is modified
+            if self.is_modified():
+                response = askyesnocancel(
+                    "Confirm",
+                    f"Discard changes and open the new file?",
+                    default='no',
+                    parent=self.root,
+                )
+                if response is False: first_path = None
+                elif response is None: return 'break'
+        
+        if first_path:
+            state = self.load_file_into_editor(first_path)
+            if state is not True:
+                print(f"Dropped file error: {state}")
+                showerror("Drop Error", f"Dropped file error: {state}", parent=self.root)
+                
+        # Handle additional files by opening new instances
+        if len(paths) > 1:
+            if INDEPENDENT_WINDOWS:
+                import subprocess
+                
+            for extra_path in paths[1:]:
+                if os.path.isfile(extra_path):
+                    if INDEPENDENT_WINDOWS:
+                        # Relaunch as a primary instance
+                        executable = sys.executable
+                        is_compiled = getattr(sys, 'frozen', False)
+                        if self.current_file_path: arg = os.path.abspath(self.current_file_path)
+                        else: arg = ''
+                        if is_compiled: args = [executable, arg]     # app.bin file.txt
+                        else: args = [executable, sys.argv[0], arg]  # python script.py file.txt
+                        subprocess.Popen(args)
+                    else:
+                        # Launch as secondary instances (Toplevel windows)
+                        QuickTextEditor(extra_path, is_primary=False)
+        return 'break'
+     
+    def new_file(self, event=None):
+        """Close current file/draft and create a new draft."""
+        # Check for unsaved changes before
+        if self.is_modified():
+            response = askyesno(
+                "Confirm",
+                "Discard current text and start new?",
+                default='no',
+                parent=self.root,
+            )
+            if not response: return
+        
+        # Clear current text & open a new draft
+        self.text_field.delete('1.0', END)
+        self.text_field.edit_reset()
+        self.text_field.config(undo=True)
+        self.current_file_path = None
+        self.update_mtime()
+        self.update_initial_hash()
+        self.set_title()
+        return 'break'
+
+    def open_file(self, event=None):
+        """Open select file(s) dialog."""      
+        # Open file dialog & check selected file size
+        paths = askopenfilename(multiple=True, parent=self.root)
+        if not paths: return 'break'
+        first_path = paths[0]
+        
+        # Check for unsaved changes
+        if self.is_modified():
+            response = askyesnocancel(
+                "Confirm",
+                "Discard current text and open the new file(s)?",
+                default='no',
+                parent=self.root,
+            )
+            if response is False: first_path = None
+            elif response is None: return 'break'
+        
+        if first_path:
+            state = self.load_file_into_editor(first_path)
+            if state is not True:
+                print(f"Error opening file: {state}")
+                showerror("File Opening Error", f"Error opening file: {state}", parent=self.root)
+        
+        # Handle additional files by opening new instances
+        if len(paths) > 1:
+            if INDEPENDENT_WINDOWS:
+                import subprocess
+                
+            for extra_path in paths[1:]:
+                if os.path.isfile(extra_path):
+                    if INDEPENDENT_WINDOWS:
+                        # Relaunch as a primary instance
+                        executable = sys.executable
+                        is_compiled = getattr(sys, 'frozen', False)
+                        if self.current_file_path: arg = os.path.abspath(self.current_file_path)
+                        else: arg = ''
+                        if is_compiled: args = [executable, arg]     # app.bin file.txt
+                        else: args = [executable, sys.argv[0], arg]  # python script.py file.txt
+                        subprocess.Popen(args)
+                    else:
+                        # Launch as secondary instances (Toplevel windows)
+                        QuickTextEditor(extra_path, is_primary=False)
+        return 'break'
+
+    def save_file(self, event=None):
+        """Write current edited content to file."""
+        if not self.current_file_path:
+            # If this is an unsaved draft, ask for a saving path
+            self.current_file_path = asksaveasfilename(
+                initialfile=(self.text_field.get('1.0', 'end-1c').strip().split() or ['Text'])[0],
+                defaultextension='.txt',
+                filetypes=[('Plain Text', '*.txt'), ('All files', '*.*')],
+                title='Save As',
+                parent=self.root,
+            )
+        
+        if self.current_file_path:
+            try:
+                # Save the draft
+                content = self.text_field.get('1.0', 'end-1c')
+                # raise Exception(':P')
+                with open(self.current_file_path, 'w', encoding=ENCODING, errors=ENCODING_ERROR_HANDLER) as f:
+                    f.write(content)
+                self.update_mtime()
+                self.update_initial_hash()
+                self.set_title()
+                return True
+            except Exception as e:
+                print(f"Error saving file: {e}")
+                showerror("File Save Error", f"Could not save file:\n{e}", parent=self.root)
+                return False
     
-    def on_close():
-        nonlocal geometry, maximized
+    def save_file_as(self, event=None):
+        """Open a save as dialog."""
+        # Temporarily clear the current file path to force a save-as dialog
+        old_path = self.current_file_path
+        self.current_file_path = None
+        if not self.save_file():
+            self.current_file_path = old_path
+    
+    def get_content_hash(self):
+        """Quickly hash the content of the text field for comparison."""
+        # Get content hash quickly
+        if self.editing_big_file: return None
+        return hash(self.text_field.get('1.0', 'end-1c'))
+
+    def update_initial_hash(self, from_file=False):
+        """Quickly hash the content of draft or the loaded file."""
+        if from_file and path_exist(self.current_file_path) and not self.editing_big_file:
+            # Update the hash of the loaded file (if any)
+            with open(self.current_file_path, 'r', encoding=ENCODING, errors=ENCODING_ERROR_HANDLER) as f:
+                self.initial_content_hash = hash(f.read())
+        else:
+            # Update the hash of the current text field (for drafts or reloaded content)
+            self.initial_content_hash = self.get_content_hash()
+    
+    def update_mtime(self):
+        """Get the time of the currently opened file for external modification detection."""
+        # Get the modification time of the last loaded file
+        if self.current_file_path and path_exist(self.current_file_path):
+            self.last_mtime = os.path.getmtime(self.current_file_path)
+        else:
+            self.last_mtime = 0
+    
+    def set_title(self):
+        """Change the window title."""
+        # Change the main window title
+        name = base_name(self.current_file_path) if self.current_file_path else "Untitled"
+        self.root.title(f"{name} - Quick Text Editor")
+
+    def is_modified(self):
+        """Compare hashes to detect text modification."""
+        # Check if the file/draft was modified or not
+        if self.editing_big_file: return True
+        if not self.current_file_path:
+            current_text = self.text_field.get('1.0', 'end-1c')
+            return bool(current_text)
+        else:
+            return self.get_content_hash() != self.initial_content_hash
+
+    def on_close(self):
+        """Check for unsaved work, save config and close."""
+        import gc
+        global secondary_windows
+        self.closed = True
+        
         # Check if there are changes
         should_prompt = False
-        if is_modified(): should_prompt = True
+        if self.is_modified(): should_prompt = True
         if should_prompt:
             response = askyesnocancel(
                 "Unsaved Changes",
                 "Save changes before exiting?",
                 default='cancel',
-                parent=root,
+                parent=self.root,
             )
             if response is True:
-                if not save_file():
+                if not self.save_file():
                     return
             elif response is None:
                 return
         
         # Save states
-        if root.state() == 'zoomed': maximized = True
+        if self.root.state() == 'zoomed': self.maximized = True
         else:
-            try: maximized = True if root.attributes('-zoomed') else False
-            except: maximized = False
+            try: self.maximized = True if self.root.attributes('-zoomed') else False
+            except: self.maximized = False
         
-        root.state('normal')
-        geometry = root.geometry()
+        self.root.state('normal')
+        self.geometry = self.root.geometry()
         
-        # Prepare and save final config
+        # Save final config
         final_config = {
-            'geometry': geometry,
-            'maximized': maximized,
-            'font_priority': font_priority,
-            'font_size': font_size,
-            'dark_mode': dark_mode,
-            'dark_bg': dark_bg,
-            'dark_fg': dark_fg,
-            'light_bg': light_bg,
-            'light_fg': light_fg,
-            'indent_size': indent_size,
-            'max_undo': max_undo,
-            'wrap': wrap,
+            'geometry': self.geometry,
+            'maximized': self.maximized,
+            'text_font_size': self.text_font_size,
+            'dark_mode': self.dark_mode,
+            'wrap': self.wrap,
         }
+        
+        for key in config:
+            if key not in final_config:
+                final_config[key] = config[key]
+        
+        final_config = {key: final_config[key] for key in config}
         save_config(final_config)
-        root.destroy()
-
-    # --- UI SETUP ---
-    root = TkinterDnD.Tk()
-    root.geometry(geometry)
-    root.minsize(700, 150)
-    root.protocol('WM_DELETE_WINDOW', on_close)
-    root.bind('<FocusIn>', check_external_modification)
-    root.report_callback_exception = handle_exception
-    if maximized:
-        try: root.state('zoomed')
-        except:
-            try: root.wm_state('zoomed')
-            except:
-                try: root.attributes('-zoomed', True)
-                except: pass
-    
-    # Font Type
-    text_font = next((f for f in font_priority if check_font_exists(f)), 'monospace')
-    text_font = [text_font, font_size]
-    ui_font = next((f for f in UI_FONT_PRIORITY if check_font_exists(f)), 'TkDefaultFont')
-    ui_font = [ui_font, 11]
-    
-    # Key Bindings
-    root.bind_all(f'<{PREFIX_KEY}-plus>', lambda e: change_font(1))
-    root.bind_all(f'<{PREFIX_KEY}-equal>', lambda e: change_font(1))
-    root.bind_all(f'<{PREFIX_KEY}-minus>', lambda e: change_font(-1))
-    root.bind_all(f'<{PREFIX_KEY}-n>', new_file)
-    root.bind_all(f'<{PREFIX_KEY}-o>', open_file)
-    root.bind_all(f'<{PREFIX_KEY}-s>', save_file)
-    root.bind_all(f'<{PREFIX_KEY}-Shift-s>', save_file_as)
-    root.bind_all(f'<{PREFIX_KEY}-w>', toggle_wrap)
-    root.bind_all(f'<{PREFIX_KEY}-t>', toggle_theme)
-    root.bind_all(f'<{PREFIX_KEY}-f>', open_search)
-
-    # Top Bar
-    top_frame = Frame(root)
-    top_frame.pack(fill=X)
-
-    # Left Side Buttons
-    new_btn = Button(top_frame, text='📄 New', font=ui_font, command=new_file, relief=FLAT)
-    open_btn = Button(top_frame, text='📂 Open', font=ui_font, command=open_file, relief=FLAT)
-    save_btn = Button(top_frame, text='💾 Save', font=ui_font, command=save_file, relief=FLAT)
-    save_as_btn = Button(top_frame, text='💾 Save As', font=ui_font, command=save_file_as, relief=FLAT)
-    
-    new_btn.pack(side=LEFT, padx=(6, 2), pady=6)
-    open_btn.pack(side=LEFT, padx=2)
-    save_btn.pack(side=LEFT, padx=2)
-    save_as_btn.pack(side=LEFT, padx=2)
-
-    # Right Side Buttons
-    theme_btn = Button(top_frame, text='🌙 Dark', font=ui_font, command=toggle_theme, relief=FLAT)
-    wrap_btn = Button(top_frame, text='⤶ Wrap', font=ui_font, command=toggle_wrap, relief=FLAT)
-    shortcuts_btn = Button(top_frame, text='⌨ Shortcuts', font=ui_font, command=show_shortcuts, relief=FLAT)
-    plus_btn = Button(top_frame, text='A⁺', font=ui_font, command=lambda: change_font(+1), relief=FLAT)
-    minus_btn = Button(top_frame, text='A⁻', font=ui_font, command=lambda: change_font(-1), relief=FLAT)
-    search_btn = Button(top_frame, text='🔍 Find', font=ui_font, command=open_search, relief=FLAT)
-    
-    minus_btn.pack(side=RIGHT, padx=(2, 6), pady=6)
-    plus_btn.pack(side=RIGHT, padx=2)
-    shortcuts_btn.pack(side=RIGHT, padx=2)
-    theme_btn.pack(side=RIGHT, padx=2)
-    wrap_btn.pack(side=RIGHT, padx=2)
-    search_btn.pack(side=RIGHT, padx=2)
-
-    # Text Area
-    text_frame = Frame(root)
-    text_frame.pack(expand=True, fill=BOTH)
-    text_field = Text(text_frame, wrap='none', font=text_font, relief=FLAT, undo=True, maxundo=max_undo)
-    h_scrollbar = Scrollbar(text_frame, orient='horizontal', command=text_field.xview)
-    text_field.config(xscrollcommand=update_h_scrollbar)
-    text_field.grid(row=0, column=0, sticky='nsew')
-    h_scrollbar.grid(row=1, column=0, sticky='ew')
-
-    text_field.focus_set()
-    text_field.drop_target_register(DND_FILES)
-    text_field.dnd_bind('<<Drop>>', handle_drop)
-    # This command might be needed in linux for drag&drop: sudo apt-get install tk-dev
-   
-    text_field.bind(f'<{PREFIX_KEY}-BackSpace>', on_ctrl_backspace)
-    text_field.bind(f'<{PREFIX_KEY}-Delete>', on_ctrl_delete)
-    text_field.bind(f'<{PREFIX_KEY}-x>', on_ctrl_x)
-    text_field.bind(f'<{PREFIX_KEY}-c>', on_ctrl_c)
-    text_field.bind('<Tab>', on_tab)
-    text_field.bind('<Shift-Tab>', on_shift_tab)
-    text_field.bind(f'<{PREFIX_KEY}-a>', on_ctrl_a)
-    text_field.bind(f'<{PREFIX_KEY}-d>', on_ctrl_d)
-
-    v_scrollbar = Scrollbar(text_frame, command=text_field.yview)
-    v_scrollbar.grid(row=0, column=1, sticky='ns')
-    text_frame.grid_columnconfigure(0, weight=1)
-    text_frame.grid_rowconfigure(0, weight=1)
-    text_field.config(yscrollcommand=update_v_scrollbar)
-    
-    # Final touches
-    if wrap: toggle_wrap()
-    apply_theme()
-    set_title()
-    
-    # Open file if available and hash it
-    if current_file_path and path_exist(current_file_path) and check_file_size(current_file_path):
-        try:
-            with open(current_file_path, 'r', encoding=ENCODING, errors=ENCODING_ERROR_HANDLER) as f:
-                text_field.insert('1.0', f.read())
-            text_field.mark_set("insert", "1.0")
-            text_field.see("1.0")
-            text_field.edit_reset()
-            update_mtime()
-            update_initial_hash()
-        except Exception as e:
-            print(f"Startup file load error: {e}")
+        
+        # Clear text & Unregister DND to sever the Tcl/Python reference cycle
+        self.text_field.delete('1.0', END)
+        self.text_field.edit_reset()
+        self.text_field.drop_target_unregister()
+        
+        # Unbind all events and protocols to clear CallWrappers
+        self.text_field.bindtags(('',))
+        self.root.bindtags(('',))
+        self.text_field.destroy()
+        
+        # Stop & cancel scheduled checks
+        # if self.is_primary:
+            # self.check_queue = lambda: None
+            # self.check_external_modification = lambda: None
+            # try: self.root.after_cancel(self.queue_check_id)        
+            # except: pass
+            # try: self.root.after_cancel(self.external_check_id)
+            # except: pass
+        
+        # If this is the PRIMARY window, destory it if it's alone
+        # If other windows are open, just hide the primary window
+        if self.is_primary:
+            if secondary_windows > 0:
+                self.root.withdraw()
+                # Leave the hidden window empty to free memory
+                # Shortcuts & Search toplevel windows aren't an issue since they are only created when clicked
+                for widget in self.root.winfo_children():
+                    if not isinstance(widget, Toplevel):
+                        widget.destroy()
+                        del widget
+            else:
+                # Primary window is alone, kill & close everything
+                self.root.destroy()
             
-    elif current_file_path and not path_exist(current_file_path):
-        # Use a temporary path variable to avoid scheduled 'file deleted' popup when focusing on error dialog
-        rejected_path = current_file_path
-        current_file_path = None
-        if not path_exist(rejected_path):
-            showerror("File Load Error", f"'{rejected_path}' doesn't exist!")
+        # If a secondary window is closed, just destroy it
+        # If it's the last, close mother root as well
+        else:
+            secondary_windows -= 1
+            self.root.destroy()
+            del self.root
+            # If the primary is hidden AND this was the last secondary, kill the app
+            if secondary_windows == 0 and mother_root.wm_state() == 'withdrawn':
+                mother_root.destroy()
+        
+            # Blast everything, I don't care
+            for attr in vars(self).copy().keys(): delattr(self, attr)
+        gc.collect()
+
+# --- MAIN ---
+def manage_multi_path_request(requested_paths: list):
+    """If the primary instance starts with multi passed paths as arguments, this will handle it."""
+    main_path = requested_paths[0]
+    if len(requested_paths) == 1:
+        # Only one path was requested, launch directly
+        launch_as_primary(main_path)
+    else:
+        # Launch the first path here and queue others
+        if INDEPENDENT_WINDOWS:
+            for path in requested_paths[1:]:
+                import subprocess
+                executable = sys.executable
+                is_compiled = getattr(sys, 'frozen', False)
+                arg = os.path.abspath(path)
+                if is_compiled: args = [executable, arg]     # app.bin file.txt
+                else: args = [executable, sys.argv[0], arg]  # python script.py file.txt
+                subprocess.Popen(args)
+        else:
+            queue_paths = '\n'.join(requested_paths[1:])
+            try:
+                with open(QUEUE_FILE, 'a', encoding=ENCODING, errors=ENCODING_ERROR_HANDLER) as f:
+                    f.write(queue_paths + '\n')
+            except Exception as e:
+                # I can't go further in handling permission errors
+                print(f'Error opening other requested files: {e}')
+        launch_as_primary(main_path)
+
+def launch_as_primary(file_path=''):
+    """Launch the full GUI as Tk root."""
+    try:
+        from tkinter import font
+        from tkinter import (Tk, Frame, Button, Text, Label, Scrollbar, Toplevel, Entry, IntVar,
+                             END, X, Y, LEFT, RIGHT, BOTH, FLAT)
+        from tkinter.messagebox import askyesno, askyesnocancel, showerror
+        from tkinter.filedialog import askopenfilename, asksaveasfilename
+        from tkinterdnd2 import DND_FILES, TkinterDnD
+        globals().update(locals())
+    except Exception as e:
+        print(f'Error: {e}')
+        print("Perhaps you didn't install a required module? Use 'pip' to install it.")
+        sys.exit(1)
+
+    QuickTextEditor(file_path)
+
+def main():
+    """The main logic for organizing multi-instances and multi-paths requests."""
+    global INDEPENDENT_WINDOWS, lock
+    # Check if a file paths was passed at startup (python main.py file1.txt file2.txt etc)
+    requested_paths = sys.argv[1:] if len(sys.argv) > 1 else ['']
+    requested_paths = [str(Path(path)) if path else '' for path in requested_paths]
     
-    # Start
-    try: root.mainloop()
-    except (KeyboardInterrupt, EOFError): print("Editor closed via terminal interruption.")
+    INDEPENDENT_WINDOWS = config['independent_windows']
+    has_write = True
+    
+    if not INDEPENDENT_WINDOWS:
+        has_write = not path_exist(QUEUE_FILE) or os.access(QUEUE_FILE, os.W_OK)
+        
+    if INDEPENDENT_WINDOWS:
+        # Lock is only needed to organize instances in one process, but here each instance is a process
+        lock = True
+    else:
+        # Check if a previous primary instance is dominating
+        lock = get_lock()
+        
+    if lock or not has_write:
+        # We are Primary: Start the main window with the main path, and queue the others (if any)
+        if not has_write:
+            print('Queue file is inaccessible.')
+            print('Switched to slow free-instance mode, where each program instance has its own memory allocation.')
+        try: os.remove(QUEUE_FILE)
+        except: pass
+        manage_multi_path_request(requested_paths)
+        
+    else:
+        # We are Secondary: Write to queue and exit
+        try:
+            # raise Exception(':P')
+            queue_paths = '\n'.join(requested_paths)
+            with open(QUEUE_FILE, 'a', encoding=ENCODING, errors=ENCODING_ERROR_HANDLER) as f:
+                f.write(queue_paths + '\n')
+            sys.exit(0)
+        except Exception as e:
+            print(f'Error writing queue file: {e}')
+            print('Switched to slow free-instance mode, where each program instance has its own memory allocation.')
+            # Launch as a primary instance for the first path, and queue others to be opened after
+            manage_multi_path_request(requested_paths)
 
 if __name__ == '__main__':
-    # Supports opening a file passed as an argument: python script.py my_file.txt
-    target_path = str(Path(sys.argv[1])) if len(sys.argv) > 1 else None
-    quick_text_editor(target_path)
-    sys.exit(0)
+    try:
+        main()
+    finally:
+        # Clean up before exiting
+        # LOCK file will be automatically closed & released by the OS
+        if lock:    # Only the primary instance having the lock can clean the QUEUE file.
+            try: os.remove(QUEUE_FILE)
+            except: pass
+        if INDEPENDENT_WINDOWS and path_exist(LOCK_FILE):
+            try: os.remove(LOCK_FILE)
+            except: pass
