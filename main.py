@@ -68,6 +68,9 @@ mother_root = None
 secondary_windows = 0
 
 if IS_COMPILED:
+    # The app will be compiled as GUI, no console will appear so we need an error logger
+    # This is only needed at startup, as most other runtime errors will be displayed in a dialog
+    # So even if a file race happens at startup, we'll get the same error by the last app instance that wrote it
     import atexit
     class LOG(object):
         """Handle writing stdout and stderr to a file."""
@@ -145,7 +148,7 @@ def save_config(config):
     try:
         # raise Exception(':P')
         fd, temp_path = tempfile.mkstemp(dir=APP_DIR, text=True)
-        with os.fdopen(fd, 'w', encoding=ENCODING) as f:
+        with os.fdopen(fd, 'w', encoding=ENCODING, errors='replace') as f:
             json.dump(config, f, indent=4)
         os.replace(temp_path, CONFIG_FILE)
         
@@ -177,7 +180,7 @@ class QuickTextEditor:
     """The main window of the GUI editor with all of its widgets."""
     # Config is applied for all instances
     global config
-    config = load_config()
+    config = load_config()    # This will be loaded at script startup because its in the class level
     
     geometry  = config['geometry']
     maximized = config['maximized']
@@ -372,23 +375,25 @@ class QuickTextEditor:
     
     def launch(self):
         """Launch the window with a file (if any)."""
+        # Set current path to None in case of errors
+        # the load_file_into_editor function will auto re-assign the current path to the opened file
+        path = self.current_file_path
+        self.current_file_path = None
+        
         # Open file if available and hash it
-        if self.current_file_path and path_exist(self.current_file_path):
-            state = self.load_file_into_editor(self.current_file_path)
+        if path and path_exist(path):
+            state = self.load_file_into_editor(path)    # This will auto assign current_path to opened file
             if state is not True:
                 print(f"Startup file load error: {state}")
                 self.root.after(256, lambda: showerror("File Opening Error", f"Error opening file: {state}", parent=self.root))
-                self.current_file_path = None
                 
-        elif self.current_file_path and not path_exist(self.current_file_path):
+        elif path and not path_exist(path):
             # Immediately use a temporary path variable to avoid scheduled 'file deleted' popup when focusing on error dialog
-            missing_file = self.current_file_path
-            self.current_file_path = None
             def ask_create_file():
                 # Ask to create the missing file
                 response = askyesno(
                     "Absent File",
-                    f"File '{missing_file}' not found!\nWould you like to create this file?",
+                    f"File '{path}' not found!\nWould you like to create this file?",
                     icon='question',
                     default='yes',
                     parent=self.root,
@@ -397,26 +402,24 @@ class QuickTextEditor:
                 if response is True:
                     try:
                         # raise Exception(':P')
-                        os.makedirs(os.path.dirname(missing_file), exist_ok=True)
-                        with open(missing_file, 'w', encoding=ENCODING, errors=ENCODING_ERROR_HANDLER):
+                        dirname = os.path.dirname(path)
+                        if dirname: os.makedirs(dirname, exist_ok=True)
+                        with open(path, 'w', encoding=ENCODING, errors=ENCODING_ERROR_HANDLER):
                             pass
-                        self.current_file_path = missing_file
-                        state = self.load_file_into_editor(self.current_file_path)
+                        state = self.load_file_into_editor(path)        # This will auto assign current_path to opened file
                         if state is not True:
                             print(f"Startup file load error: {state}")
                             showerror("File Opening Error", f"Error opening file: {state}", parent=self.root)
-                            self.current_file_path = None
                     except Exception as e:
-                        showerror("Creation Error", f"Error while creating file: {e}", parent=self.root)
+                        showerror("Creation Error", f"Error while creating file '{path}': {e}", parent=self.root)
             # Schedule the dialog to appear after 256ms so it's well attached to the main window
             self.root.after(256, ask_create_file)
         
         # Start
+        self.external_check_id = self.root.after(self.external_check_interval, self.check_external_modification)
         if self.is_primary:
-            self.queue_check_id = self.root.after(self.queue_check_interval, self.check_queue)
-            self.external_check_id = self.root.after(self.external_check_interval, self.check_external_modification)
-            try:
-                self.root.mainloop()
+            if not INDEPENDENT_WINDOWS: self.queue_check_id = self.root.after(self.queue_check_interval, self.check_queue)
+            try: self.root.mainloop()
             except (KeyboardInterrupt, EOFError):
                 print("Editor closed via terminal interruption.")
                 sys.exit(0)
@@ -766,7 +769,7 @@ class QuickTextEditor:
         global lock
         if not self.is_primary: return
         if INDEPENDENT_WINDOWS: return
-        if self.closed: return
+        # if self.closed: return
         
         # Check if another instance requested opening a file
         if os.path.exists(QUEUE_FILE):    # If it exists, a queue is confirmed
@@ -909,7 +912,7 @@ class QuickTextEditor:
         if not os.path.isfile(path):
             showerror("File Opening Error", f"Path '{path}' is not a file!", parent=self.root)
             return True
-        if not self.check_file_size(path): 
+        if not self.check_file_size(path):
             return True
         try:
             with open(path, 'r', encoding=ENCODING, errors=ENCODING_ERROR_HANDLER) as f:
@@ -1053,11 +1056,14 @@ class QuickTextEditor:
         
         if self.current_file_path:
             try:
-                # Save the draft
-                content = self.text_field.get('1.0', 'end-1c')
+                import tempfile
                 # raise Exception(':P')
-                with open(self.current_file_path, 'w', encoding=ENCODING, errors=ENCODING_ERROR_HANDLER) as f:
+                # Write to a temp file then replace temp with current file
+                content = self.text_field.get('1.0', 'end-1c')
+                fd, temp_path = tempfile.mkstemp(dir=APP_DIR, text=True)
+                with os.fdopen(fd, 'w', encoding=ENCODING, errors=ENCODING_ERROR_HANDLER) as f:
                     f.write(content)
+                os.replace(temp_path, self.current_file_path)
                 self.update_mtime()
                 self.update_initial_hash()
                 self.set_title()
@@ -1182,6 +1188,7 @@ class QuickTextEditor:
         
         # If this is the PRIMARY window, destory it if it's alone
         # If other windows are open, just hide the primary window
+        self.closed = True
         if self.is_primary:
             if secondary_windows > 0:
                 self.root.withdraw()
@@ -1200,7 +1207,6 @@ class QuickTextEditor:
         # If it's the last, close mother root as well
         else:
             secondary_windows -= 1
-            self.closed = True
             self.root.destroy()
             del self.root
             # If the primary is hidden AND this was the last secondary, kill the app
@@ -1306,6 +1312,6 @@ if __name__ == '__main__':
             try: os.remove(QUEUE_FILE)
             except: pass
             if path_exist(LOCK_FILE):
-                lock.close()
+                if hasattr(lock, 'close'): lock.close()
                 try: os.remove(LOCK_FILE)
                 except: pass
