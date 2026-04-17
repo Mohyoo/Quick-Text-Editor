@@ -1,17 +1,28 @@
 import os
 import sys
 import json
-import tempfile
 from pathlib import Path
 
 # --- CONFIG ---
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_FILE = os.path.join(SCRIPT_DIR, 'config.json')
-LOCK_FILE = os.path.join(SCRIPT_DIR, "app.lock")
-QUEUE_FILE = os.path.join(SCRIPT_DIR, "queue.txt")
+SYSTEM = sys.platform
+IS_COMPILED = getattr(sys, 'frozen', False) or '__compiled__' in globals()
+
+if IS_COMPILED:
+    APP_DIR = os.path.dirname(os.path.abspath(sys.executable))   # Where our main bin is
+    exe_name = 'quick-text-editor'     # The bin name
+    EXECUTABLE = os.path.join(APP_DIR, exe_name)                 # Full bin path
+else:
+    EXECUTABLE = sys.executable        # python.exe or just python in Linux/macOS
+    APP_DIR = os.path.dirname(os.path.abspath(__file__))         # Where main.py is
+
+os.chdir(APP_DIR)    # Keep the script portable
+CONFIG_FILE = os.path.join(APP_DIR, 'config.json')
+LOCK_FILE = os.path.join(APP_DIR, 'app.lock')
+QUEUE_FILE = os.path.join(APP_DIR, 'queue.txt')
+LOG_FILE = os.path.join(APP_DIR, 'console_log.log')
+ICO_FILE = os.path.join(APP_DIR, 'assets', 'icon')    # For Tk, 'Assets' and 'assets' are the same
 ENCODING = 'utf-8'
 ENCODING_ERROR_HANDLER = 'surrogateescape'
-SYSTEM = sys.platform
 PREFIX_KEY = 'Command' if SYSTEM == 'darwin' else 'Control'
 
 DEFAULT_CONFIG = {
@@ -47,7 +58,7 @@ DEFAULT_CONFIG = {
     'max_undo': 128,
     'big_file_size': 4,
     'wrap': False,
-    'independent_windows': False,
+    'independent_windows': True,
 }
 
 path_exist = os.path.exists
@@ -55,6 +66,60 @@ base_name = os.path.basename
 lock = None
 mother_root = None
 secondary_windows = 0
+
+if IS_COMPILED:
+    import atexit
+    class LOG(object):
+        """Handle writing stdout and stderr to a file."""
+        def __init__(self, filename):
+            try:
+                # 'w' mode safely overwrites, eliminating the need for os.remove()
+                # buffering=1 enables line-buffering, significantly boosting performance
+                # by avoiding forced flushes on every single string chunk.
+                self.file = open(filename, 'w', encoding=ENCODING, buffering=1)
+                self.enabled = True
+                
+                # Ensure the file closes cleanly when the program terminates
+                atexit.register(self.close)
+            except:
+                # Catch specific OS errors (PermissionError, IOError)
+                self.file = None
+                self.enabled = False
+
+        def write(self, data):
+            if self.enabled and data:
+                try:
+                    self.file.write(data)
+                    # Removed manual self.file.flush() here. 
+                    # Line-buffering handles it without killing performance.
+                except Exception:
+                    pass
+
+        def flush(self):
+            # Ensure physical disk write (Data Integrity)
+            if self.enabled and not self.file.closed:
+                try: self.file.flush()
+                except Exception: pass
+
+        def close(self):
+            if self.enabled and not self.file.closed:
+                self.flush()
+                self.file.close()
+                self.enabled = False
+
+        def __getattr__(self, attr):
+            # Delegate methods securely, checking if file is still open
+            if self.enabled and not self.file.closed: 
+                return getattr(self.file, attr)
+            return lambda *args, **kwargs: None
+
+        def isatty(self):
+            return False
+
+    # Initialize and override stdout & stderr
+    logfile = LOG(LOG_FILE)
+    sys.stdout = logfile
+    sys.stderr = logfile
 
 def load_config():
     """Load settings from the config file."""
@@ -70,14 +135,16 @@ def load_config():
 
 def save_config(config):
     """Save settings safely using a temporary file to prevent corruption."""
+    import tempfile
     # Clean the config JSON
     for key in config.copy().keys():
         if key not in DEFAULT_CONFIG:
             del config[key]
     
+    temp_path = ''
     try:
         # raise Exception(':P')
-        fd, temp_path = tempfile.mkstemp(dir=SCRIPT_DIR, text=True)
+        fd, temp_path = tempfile.mkstemp(dir=APP_DIR, text=True)
         with os.fdopen(fd, 'w', encoding=ENCODING) as f:
             json.dump(config, f, indent=4)
         os.replace(temp_path, CONFIG_FILE)
@@ -150,8 +217,8 @@ class QuickTextEditor:
         if len(dimensions) == 4:
             from random import randint, choice
             w, h, x, y = dimensions
-            shifted_x = int(x) + randint(5, 50) * choice([-1, 1])
-            shifted_y = int(y) + randint(5, 50) * choice([-1, 1])
+            shifted_x = int(x) + randint(5, 35) * choice([-1, 1])
+            shifted_y = int(y) + randint(5, 35) * choice([-1, 1])
             self.geometry = f"{w}x{h}+{shifted_x}+{shifted_y}"
         
         # Load & Launch
@@ -171,8 +238,9 @@ class QuickTextEditor:
             secondary_windows += 1
             
         self.root.geometry(self.geometry)
-        self.root.minsize(700, 150)
+        self.root.minsize(310, 150)
         self.root.protocol('WM_DELETE_WINDOW', self.on_close)
+        self.root.after(512, self.set_icon)    # Set icon after 0.5s to avoid hanging while loading UI
         if self.maximized:
             try: self.root.state('zoomed')
             except:
@@ -180,7 +248,7 @@ class QuickTextEditor:
                 except:
                     try: self.root.attributes('-zoomed', True)
                     except: pass
-        
+                    
         # Font Type (Applied for all instances)
         if self.is_primary:
             text_font = next((f for f in self.text_font_priority if self.check_font_exists(f)), 'monospace')
@@ -244,6 +312,7 @@ class QuickTextEditor:
         self.text_field.dnd_bind('<<Drop>>', self.handle_drop)
         # This command might be needed in linux for drag&drop: sudo apt-get install tk-dev
         
+        # Key bindings
         self.text_field.unbind_class("Text", f"<{PREFIX_KEY}-o>")
         self.text_field.unbind_class("Text", f"<{PREFIX_KEY}-t>")
         self.text_field.unbind_class("Text", f"<{PREFIX_KEY}-s>")
@@ -260,17 +329,46 @@ class QuickTextEditor:
         self.text_field.bind('<Shift-Tab>', self.on_shift_tab)
         self.text_field.bind(f'<{PREFIX_KEY}-a>', self.on_ctrl_a)
         self.text_field.bind(f'<{PREFIX_KEY}-d>', self.on_ctrl_d)
-
+        
+        # Vertical Scrollbar
         self.v_scrollbar = Scrollbar(self.text_frame, command=self.text_field.yview)
         self.v_scrollbar.grid(row=0, column=1, sticky='ns')
         self.text_frame.grid_columnconfigure(0, weight=1)
         self.text_frame.grid_rowconfigure(0, weight=1)
         self.text_field.config(yscrollcommand=self.update_v_scrollbar)
         
+        # Right-click context menu
+        self.context_menu = Menu(self.root, tearoff=0, font=ui_font)
+        acc_key = '⌘' if SYSTEM == 'darwin' else 'Ctrl'
+        distance = ' ' * 7
+        
+        self.context_menu.add_command(label='↩️ Undo', accelerator=f"{distance}{acc_key}+Z", command=self.handle_undo)
+        self.context_menu.add_command(label='↪️ Redo', accelerator=f"{distance}{acc_key}+Y", command=self.handle_redo)
+        self.context_menu.add_separator()
+        self.context_menu.add_command(label='✂ Cut', accelerator=f"{distance}{acc_key}+X", command=lambda: self.text_field.event_generate('<<Cut>>'))
+        self.context_menu.add_command(label='⧉ Copy', accelerator=f"{distance}{acc_key}+C", command=lambda: self.text_field.event_generate('<<Copy>>'))
+        self.context_menu.add_command(label='📋 Paste', accelerator=f"{distance}{acc_key}+V", command=lambda: self.text_field.event_generate('<<Paste>>'))
+        self.context_menu.add_command(label='❌ Delete', accelerator=f"{distance}Backspace/Del", command=lambda: self.text_field.delete('sel.first', 'sel.last') if self.text_field.tag_ranges('sel') else None)
+        self.context_menu.add_separator()
+        self.context_menu.add_command(label=f'⛶ Select All', accelerator=f"{distance}{acc_key}+A", command=lambda: self.on_ctrl_a(None))
+
+        self.text_field.bind('<Button-3>', self.show_context_menu)
+        if SYSTEM == 'darwin':
+            self.text_field.bind('<Button-2>', self.show_context_menu)
+        
         # Final touches
-        if self.wrap: self.toggle_wrap()
+        if self.wrap: self.toggle_wrap(startup=True)
         self.apply_theme()
         self.set_title()
+    
+    def set_icon(self):
+        if SYSTEM == 'win32':
+            # Looks like Tk can find 'Assets' even if we type 'assets'
+            self.root.iconbitmap(ICO_FILE+'.ico')
+        else:
+            from tkinter import PhotoImage
+            icon = PhotoImage(file=ICO_FILE+'.png')
+            self.root.wm_iconphoto(True, icon)
     
     def launch(self):
         """Launch the window with a file (if any)."""
@@ -283,19 +381,45 @@ class QuickTextEditor:
                 self.current_file_path = None
                 
         elif self.current_file_path and not path_exist(self.current_file_path):
-            # Use a temporary path variable to avoid scheduled 'file deleted' popup when focusing on error dialog
-            rejected_path = self.current_file_path
+            # Immediately use a temporary path variable to avoid scheduled 'file deleted' popup when focusing on error dialog
+            missing_file = self.current_file_path
             self.current_file_path = None
-            if not path_exist(rejected_path):
-                # Schedule the error to appear after 256ms so it's well attached to the main window
-                self.root.after(256, lambda: showerror("File Load Error", f"'{rejected_path}' doesn't exist!", parent=self.root))
+            def ask_create_file():
+                # Ask to create the missing file
+                response = askyesno(
+                    "Absent File",
+                    f"File '{missing_file}' not found!\nWould you like to create this file?",
+                    icon='question',
+                    default='yes',
+                    parent=self.root,
+                )
+                # If YES, write an empty file
+                if response is True:
+                    try:
+                        # raise Exception(':P')
+                        os.makedirs(os.path.dirname(missing_file), exist_ok=True)
+                        with open(missing_file, 'w', encoding=ENCODING, errors=ENCODING_ERROR_HANDLER):
+                            pass
+                        self.current_file_path = missing_file
+                        state = self.load_file_into_editor(self.current_file_path)
+                        if state is not True:
+                            print(f"Startup file load error: {state}")
+                            showerror("File Opening Error", f"Error opening file: {state}", parent=self.root)
+                            self.current_file_path = None
+                    except Exception as e:
+                        showerror("Creation Error", f"Error while creating file: {e}", parent=self.root)
+            # Schedule the dialog to appear after 256ms so it's well attached to the main window
+            self.root.after(256, ask_create_file)
         
         # Start
         if self.is_primary:
             self.queue_check_id = self.root.after(self.queue_check_interval, self.check_queue)
             self.external_check_id = self.root.after(self.external_check_interval, self.check_external_modification)
-            try: self.root.mainloop()
-            except (KeyboardInterrupt, EOFError): print("Editor closed via terminal interruption.")
+            try:
+                self.root.mainloop()
+            except (KeyboardInterrupt, EOFError):
+                print("Editor closed via terminal interruption.")
+                sys.exit(0)
          
     def handle_exception(self, exc, val, tb):
         """Handle internal Tk errors without freezing the app."""
@@ -304,7 +428,7 @@ class QuickTextEditor:
         if issubclass(exc, (KeyboardInterrupt, EOFError)):
             print("\nUser requested termination.")
             self.root.destroy()
-            return 'break'
+            sys.exit(0)
         # Show error instead of breaking the app
         err = ''.join(traceback.format_exception(exc, val, tb))
         print(f"\nInternal Error Caught:\n{err}")
@@ -340,6 +464,8 @@ class QuickTextEditor:
             'Ctrl-T          →  Toggle Theme\n'
             'Ctrl-W          →  Toggle Word-Wrap\n'
             'Ctrl-F          →  Find/Search\n'
+            'Ctrl-Z          →  Undo\n'
+            'Ctrl-Y          →  Redo\n'
             'Ctrl-(+)        →  Zoom In\n'
             'Ctrl-(-)        →  Zoom Out\n'
             'Ctrl-C          →  Copy (whole line if no selection)\n'
@@ -515,16 +641,20 @@ class QuickTextEditor:
             self.top_frame.config(bg='#243B49')
             self.text_field.config(bg=self.dark_bg, fg=self.dark_fg, insertbackground='#e5e7eb')
             self.theme_btn.config(text='☀ Light')
+            self.context_menu.config(bg='#1e293b', fg='#e5e7eb', activebackground='#334155', activeforeground='#ffffff')
             for btn in buttons:
                 btn.config(bg='#212121', fg='#e5e7eb', activebackground='#334155')
+            self.save_btn.config(fg='#c084fc')
         else:
             # Switch to light theme
             self.root.config(bg='#f8fafc')
             self.top_frame.config(bg='#2d5ac4')
             self.text_field.config(bg=self.light_bg, fg=self.light_fg, insertbackground='black')
             self.theme_btn.config(text='🌙 Dark')
+            self.context_menu.config(bg='#F5F5F5', fg='#000000', activebackground='#e5e7eb', activeforeground='#000000')
             for btn in buttons:
                 btn.config(bg='#e5e7eb', fg='black', activebackground='#d1d5db')
+            self.save_btn.config(fg='#581c87')
 
     def toggle_theme(self, event=None):
         """Toggle current theme by inverting the dark_mode state."""
@@ -533,7 +663,7 @@ class QuickTextEditor:
         self.apply_theme()
         return 'break'
     
-    def toggle_wrap(self, event=None):
+    def toggle_wrap(self, startup=False, event=None):
         """Wrap/unwrap text field content."""
         if self.text_field.cget('wrap') == 'none':
             # Turn ON word-wrap
@@ -545,7 +675,8 @@ class QuickTextEditor:
             self.wrap_btn.config(text='⤶ Wrap')
         # Show h-scrollbar if word-wrap is OFF, otherwise hide it
         self.update_h_scrollbar()
-        self.wrap = not self.wrap
+        # Toggle the state only when the user click, not at startup
+        if not startup: self.wrap = not self.wrap
     
     def open_search(self, event=None):
         """Open a small dialog to search for a word."""
@@ -613,7 +744,22 @@ class QuickTextEditor:
         x = self.root.winfo_rootx() + (self.root.winfo_width() - win_w) // 2
         y = self.root.winfo_rooty() + (self.root.winfo_height() - win_h) // 2
         search_win.geometry(f'{win_w}x{win_h}+{x}+{y}')
+    
+    def show_context_menu(self, event):
+        """Display the right-click menu at the cursor position."""
+        self.context_menu.tk_popup(event.x_root, event.y_root)
+        return "break"
+    
+    def handle_undo(self):
+        """Cancel last change."""
+        try: self.text_field.edit_undo()
+        except: pass  # Nothing to undo
 
+    def handle_redo(self):
+        """Repeat last change."""
+        try: self.text_field.edit_redo()
+        except: pass  # Nothing to redo
+    
     # --- FILE HANDLING ---
     def check_queue(self):
         """Check if other instances requested opening file(s)."""
@@ -642,12 +788,9 @@ class QuickTextEditor:
                 lock = None
                 save_config({**config, 'independent_windows': True})
                 # Relaunch as a primary instance
-                executable = sys.executable
-                is_compiled = getattr(sys, 'frozen', False)
-                if self.current_file_path: arg = os.path.abspath(self.current_file_path)
-                else: arg = ''
-                if is_compiled: args = [executable, arg]     # app.bin file.txt
-                else: args = [executable, sys.argv[0], arg]  # python script.py file.txt
+                arg = ''
+                if IS_COMPILED: args = [EXECUTABLE, arg]     # app.bin file.txt
+                else: args = [EXECUTABLE, sys.argv[0], arg]  # python script.py file.txt
                 subprocess.Popen(args)
                 
         # Tell the main loop to open it after 0.5s
@@ -714,21 +857,22 @@ class QuickTextEditor:
                 parent=self.root,
             )
             
-            if response:
+            if response and self.check_file_size(self.current_file_path):
                 try:
                     with open(self.current_file_path, 'r', encoding=ENCODING, errors=ENCODING_ERROR_HANDLER) as f:
                         content = f.read()
                     # Realod, save to undo stack, and scroll up
-                    # Here is a bug of scrolling to bottom when clicking Ctrl-Z
+                    # Here is a bug of scrolling to bottom when clicking Ctrl-Z. I don't wanna reset the undo history
+                    if not self.editing_big_file: self.initial_content_hash = hash(content)
                     self.text_field.config(autoseparators=False)
                     self.text_field.edit_separator()
                     self.text_field.delete('1.0', END)
                     self.text_field.insert('1.0', content)
+                    del content
                     self.text_field.edit_separator()
                     self.text_field.config(autoseparators=True)
                     self.text_field.mark_set("insert", "1.0")
                     self.text_field.see("1.0")
-                    self.update_initial_hash()
                     
                 except Exception as e:
                     print(f"Reload error: {e}")
@@ -762,6 +906,9 @@ class QuickTextEditor:
          
     def load_file_into_editor(self, path):
         """Helper to load content into the current text field."""
+        if not os.path.isfile(path):
+            showerror("File Opening Error", f"Path '{path}' is not a file!", parent=self.root)
+            return True
         if not self.check_file_size(path): 
             return True
         try:
@@ -819,12 +966,9 @@ class QuickTextEditor:
                 if os.path.isfile(extra_path):
                     if INDEPENDENT_WINDOWS:
                         # Relaunch as a primary instance
-                        executable = sys.executable
-                        is_compiled = getattr(sys, 'frozen', False)
-                        if self.current_file_path: arg = os.path.abspath(self.current_file_path)
-                        else: arg = ''
-                        if is_compiled: args = [executable, arg]     # app.bin file.txt
-                        else: args = [executable, sys.argv[0], arg]  # python script.py file.txt
+                        arg = os.path.abspath(extra_path)
+                        if IS_COMPILED: args = [EXECUTABLE, arg]     # app.bin file.txt
+                        else: args = [EXECUTABLE, sys.argv[0], arg]  # python script.py file.txt
                         subprocess.Popen(args)
                     else:
                         # Launch as secondary instances (Toplevel windows)
@@ -886,12 +1030,9 @@ class QuickTextEditor:
                 if os.path.isfile(extra_path):
                     if INDEPENDENT_WINDOWS:
                         # Relaunch as a primary instance
-                        executable = sys.executable
-                        is_compiled = getattr(sys, 'frozen', False)
-                        if self.current_file_path: arg = os.path.abspath(self.current_file_path)
-                        else: arg = ''
-                        if is_compiled: args = [executable, arg]     # app.bin file.txt
-                        else: args = [executable, sys.argv[0], arg]  # python script.py file.txt
+                        arg = os.path.abspath(extra_path)
+                        if IS_COMPILED: args = [EXECUTABLE, arg]     # app.bin file.txt
+                        else: args = [EXECUTABLE, sys.argv[0], arg]  # python script.py file.txt
                         subprocess.Popen(args)
                     else:
                         # Launch as secondary instances (Toplevel windows)
@@ -977,8 +1118,7 @@ class QuickTextEditor:
     def on_close(self):
         """Check for unsaved work, save config and close."""
         import gc
-        global secondary_windows
-        self.closed = True
+        global config, secondary_windows
         
         # Check if there are changes
         should_prompt = False
@@ -1053,12 +1193,14 @@ class QuickTextEditor:
                         del widget
             else:
                 # Primary window is alone, kill & close everything
+                self.closed = True
                 self.root.destroy()
             
         # If a secondary window is closed, just destroy it
         # If it's the last, close mother root as well
         else:
             secondary_windows -= 1
+            self.closed = True
             self.root.destroy()
             del self.root
             # If the primary is hidden AND this was the last secondary, kill the app
@@ -1081,11 +1223,9 @@ def manage_multi_path_request(requested_paths: list):
         if INDEPENDENT_WINDOWS:
             for path in requested_paths[1:]:
                 import subprocess
-                executable = sys.executable
-                is_compiled = getattr(sys, 'frozen', False)
                 arg = os.path.abspath(path)
-                if is_compiled: args = [executable, arg]     # app.bin file.txt
-                else: args = [executable, sys.argv[0], arg]  # python script.py file.txt
+                if IS_COMPILED: args = [EXECUTABLE, arg]     # app.bin file.txt
+                else: args = [EXECUTABLE, sys.argv[0], arg]  # python script.py file.txt
                 subprocess.Popen(args)
         else:
             queue_paths = '\n'.join(requested_paths[1:])
@@ -1101,7 +1241,7 @@ def launch_as_primary(file_path=''):
     """Launch the full GUI as Tk root."""
     try:
         from tkinter import font
-        from tkinter import (Tk, Frame, Button, Text, Label, Scrollbar, Toplevel, Entry, IntVar,
+        from tkinter import (Tk, Frame, Button, Text, Label, Scrollbar, Toplevel, Entry, IntVar, Menu,
                              END, X, Y, LEFT, RIGHT, BOTH, FLAT)
         from tkinter.messagebox import askyesno, askyesnocancel, showerror
         from tkinter.filedialog import askopenfilename, asksaveasfilename
@@ -1162,10 +1302,10 @@ if __name__ == '__main__':
         main()
     finally:
         # Clean up before exiting
-        # LOCK file will be automatically closed & released by the OS
-        if lock:    # Only the primary instance having the lock can clean the QUEUE file.
+        if lock:    # Only the primary instance having the lock can clean the QUEUE file
             try: os.remove(QUEUE_FILE)
             except: pass
-        if INDEPENDENT_WINDOWS and path_exist(LOCK_FILE):
-            try: os.remove(LOCK_FILE)
-            except: pass
+            if path_exist(LOCK_FILE):
+                lock.close()
+                try: os.remove(LOCK_FILE)
+                except: pass
