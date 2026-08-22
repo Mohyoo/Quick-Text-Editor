@@ -37,7 +37,7 @@ In the program directory, there will be (after the first launch) a `config.json`
 
 
 ## Compile From Source
-You may be able bundle the program using PyInstaller or cx_Freeze, but I recommend using Nuitka to avoid issues; since the program is tuned for it, beside that it provides a small performance gain:
+You may be able to bundle the program using PyInstaller or cx_Freeze, but I recommend using Nuitka to avoid issues; since the program is tuned for it, beside that it provides a small performance gain:
 
 ```
 pip install tkinterdnd2, Nuitka
